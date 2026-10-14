@@ -1,0 +1,3 @@
+partial module adm.auth.github {
+	// Sign in with GitHub over std.proto.auth.oauth2: the authorization code flow (GitHub has no OpenID Connect), the device flow, user and email lookup for a Profile, GitHub App user tokens with refresh, GitHub Enterprise base URLs
+}

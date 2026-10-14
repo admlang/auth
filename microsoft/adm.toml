@@ -1,0 +1,14 @@
+# adm.toml
+#
+# Manifest of the adm.auth.microsoft library. The [publisher] section is
+# written by `adm app init` with the publisher's key.
+
+schema = 1
+
+[publisher]
+pubkey = "ed25519:base64:ZcfhD3m1jmc/pabbwU8U1XL8wQxCBia6+HCVV14aq50="
+repo_salt = "base64:n3pT2CIhtmf/EArVcryoQ3Wbh2AZHs+Fcj5klYj8GjQ="
+
+# The line `adm search` shows for the library; `adm publish` files it.
+[apps."adm.auth.microsoft"]
+description = "Sign in with Microsoft (Entra ID)"

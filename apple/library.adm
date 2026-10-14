@@ -1,0 +1,11 @@
+// Sign in with Apple
+@manifest(version = "0.0.1")
+library adm.auth.apple {
+	use (
+		adm.auth.apple
+	)
+
+	export (
+		adm.auth.apple
+	)
+}

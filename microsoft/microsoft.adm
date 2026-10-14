@@ -1,0 +1,3 @@
+partial module adm.auth.microsoft {
+	// Sign in with Microsoft over std.proto.auth.openid: Entra ID v2 endpoints by tenant (common, organizations, consumers or an id), per-tenant issuer validation, client secrets and certificates, Microsoft Graph for a Profile, on-behalf-of tokens
+}

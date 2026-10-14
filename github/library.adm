@@ -1,0 +1,11 @@
+// Sign in with GitHub
+@manifest(version = "0.0.1")
+library adm.auth.github {
+	use (
+		adm.auth.github
+	)
+
+	export (
+		adm.auth.github
+	)
+}

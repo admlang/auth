@@ -1,0 +1,3 @@
+partial module adm.auth.google {
+	// Sign in with Google over std.proto.auth.openid: discovery, the authorization code flow with PKCE, ID token verification (also for One Tap and mobile tokens), refresh, hosted domain checks, a Profile from the claims
+}

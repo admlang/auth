@@ -13,8 +13,8 @@ use adm.auth.apple
 
 let provider = new apple.Provider(servicesId, teamId, keyId, privateKey,
 	redirectURL = "https://example.com/auth/apple")
-let start = try provider.begin(scopes = ["name", "email"])
-let login = try provider.complete(callbackForm, start)   // Apple posts the result as a form
+let request = try provider.start()              // name and email
+let login = try provider.exchange(request, callbackForm)   // Apple posts the result as a form
 let profile = login.profile
 print(profile.name)                               // present on the first sign-in only: store it
 print(profile.email)                              // may be a privaterelay.appleid.com address

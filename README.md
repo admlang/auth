@@ -16,12 +16,26 @@ the standard library because providers change these details without notice.
 
 ## Shared shape
 
-Each library is a `Provider` built from the application's client id and credential, with a
-`login` that yields `std.proto.auth.openid`'s `Login` (tokens, the ID token and its claims) and
-a `Profile` the same for every provider: `id`, `email`, `emailVerified`, `name`, `picture`,
-`locale`, and the provider's raw claims. PKCE and `state` are on for every provider; refresh
-tokens renew through the same `Provider`. A program that offers several providers writes one
-callback handler and gives it the provider by name.
+Each library is a `Provider` built from the application's client id and credential.
+`start` begins a sign-in (PKCE, `state` and, for OpenID Connect, a `nonce` always on) and
+returns the request to keep with the session; `exchange` finishes it from the callback and
+returns `std.proto.auth.openid`'s `Login`: the tokens, the ID token and its claims, and a
+`Profile` read the same way for every provider (`id`, `email`, `emailVerified`, `name`,
+`picture`, `locale`, and the provider's raw claims). `refresh` renews the tokens. Every
+`Provider` is an `openid.SignInProvider`, so a program that offers several providers writes one
+callback handler and gives it the provider by name:
+
+```adm
+use std.proto.auth.openid
+
+let providers = map<string, openid.SignInProvider>{"google": google, "github": github, "microsoft": microsoft}
+let request = try providers[name].start()
+// send the browser to request.url; at the callback:
+let login = try providers[name].exchange(request, callbackURL)
+print("{login.profile.name} <{login.profile.email}>")
+```
+
+Failures are `oauth2.OAuthError`, with the provider's error code and a `kind`.
 
 ## Tests
 

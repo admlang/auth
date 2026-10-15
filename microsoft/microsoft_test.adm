@@ -1,0 +1,287 @@
+partial module adm.auth.microsoft {
+	use (
+		std.time
+		std.testing
+		std.net.http
+		std.net.http::(Context, ServeMux, Request)
+		std.net.http.httptest
+		std.net.tls::(KeyPair)
+		std.net.url::(parseQuery)
+		std.crypto::(PrivateKey, generateECDSAKey, publicKeyOf, p256)
+		std.crypto.hash::(Hash, digest)
+		std.crypto.x509
+		std.proto.auth.jose
+		std.proto.auth.oauth2
+		std.proto.auth.openid
+	)
+
+	// A real ID token and the client it was issued to.
+	@env("ADM_TEST_MICROSOFT_ID_TOKEN")
+	internal const liveIdToken string
+
+	@env("ADM_TEST_MICROSOFT_CLIENT_ID")
+	internal const liveClientId string
+
+	internal type StopRedirects {
+		def new() {}
+
+		def follow(next Request, via Request[]) !bool {
+			return false
+		}
+	}
+
+	// A loopback Entra ID: the `common` endpoints publish an issuer
+	// template, the tenant "tid-1" signs users in and issues its own
+	// issuer, and /graph answers as Microsoft Graph.
+	internal type FakeEntra {
+		site       httptest.Server
+		op         openid.Provider
+		browser    http.Client
+		// The tenant the login page puts in the ID token.
+		tid        string                = "tid-1"
+		// The token requests seen, as forms.
+		tokenForms map<string, string>[] = []
+
+		def new(site httptest.Server, op openid.Provider) {
+			self.site = site
+			self.op = op
+			browser = site.client()
+			browser.redirects = new StopRedirects()
+		}
+
+		def signIn(authorizationURL string) !string {
+			let first = try browser.get(authorizationURL)
+			assert first.status == 303
+			let second = try browser.get(first.header("Location"))
+			assert second.status == 303
+			// Entra ID sends no `iss` in the authorization response.
+			let callback = second.header("Location")
+			let at = callback.indexOf("&iss=")
+			return callback when at < 0
+			let rest = callback[at + 1:]
+			let end = rest.indexOf("&")
+			return callback[0:at] + (end < 0 ?? ("", rest[end:]))
+		}
+
+		def provider(tenant string = "common", allowedTenants string[] = [], certificate ?KeyPair = none) Provider {
+			let secret ?Secret<string> = certificate is none ?? ("app-secret", none)
+			let p = new Provider("app", secret, certificate = certificate, redirectURL = site.url + "/cb", tenant = tenant, allowedTenants = allowedTenants, authority = site.url, httpClient = site.client())
+			p.graph = site.url + "/graph"
+			return p
+		}
+	}
+
+	internal def fakeEntra() !FakeEntra {
+		let signing = try jose.generateKey(jose.SignatureAlgorithm.RS256)
+		signing.kid = "entra-1"
+		let server = new oauth2.AuthorizationServer("http://placeholder", new jose.JwkSet([signing]))
+		let users = new openid.MemoryUserStore()
+		users.add("alice-oid", map<string, any>{"name": "Alice Liddell", "preferred_username": "alice@contoso.example"})
+		let op = new openid.Provider(server, users)
+		op.scopeClaimsInIdToken = true
+		server.scopesSupported = ["openid", "profile", "email", "offline_access", "User.Read", "api://downstream/read", "https://graph.example/.default"]
+		server.jwtBearer = def (assertion string, _ oauth2.RegisteredClient) !oauth2.Grant {
+			fail oauth2.OAuthError{message: "bad assertion", code: "invalid_grant", kind: oauth2.OAuthErrorKind.InvalidGrant, status: 400} unless assertion == "token-for-app"
+			let g = new oauth2.Grant(time.now())
+			g.subject = "alice-oid"
+			return g
+		}
+		let holder ?FakeEntra = none
+		let mux = new ServeMux()
+		try mux.handle("/login", def (ctx Context) !none {
+			let e = holder
+			fail "no fake" when e is none
+			let claims map<string, any>
+			claims.set("tid", e.tid)
+			claims.set("oid", "alice-oid")
+			return try server.complete(ctx, ctx.query("request", ""), oauth2.Decision{subject: "alice-oid", claims: claims})
+		})
+		try mux.handle("GET /\{tenant}/v2.0/.well-known/openid-configuration", def (ctx Context) !none {
+			let e = holder
+			fail "no fake" when e is none
+			let tenant = ctx.param("tenant")
+			return try ctx.notFound() unless tenant := "common" || "tid-1"
+			// As Entra ID's: no `iss` in authorization responses, and the
+			// multi-tenant endpoints name an issuer template.
+			let m = server.metadata()
+			m.authorizationResponseIssParameterSupported = false
+			m.issuer = e.site.url + "/\{tenantid}/v2.0" when tenant == "common"
+			return try ctx.blob(200, "application/json", m.json().bytes())
+		})
+		try mux.handle("POST /tid-1/v2.0/token", def (ctx Context) !none {
+			let e = holder
+			fail "no fake" when e is none
+			let form = try parseQuery(try ctx.text())
+			let seen = new map<string, string>()
+			for let name in form.keys() {
+				let v = form.get(name)
+				seen.set(name, v is none ?? ("", v))
+			}
+			e.tokenForms.push(seen)
+			return try e.op.handler().serve(ctx)
+		})
+		try mux.handle("GET /graph/me", def (ctx Context) !none {
+			return try ctx.text(401, "\{\"error\":\{\"code\":\"InvalidAuthenticationToken\",\"message\":\"Access token is empty.\"}}") unless ctx.header("Authorization").len() > "Bearer ".len()
+			return try ctx.text("\{\"id\":\"alice-oid\",\"displayName\":\"Alice Liddell\",\"mail\":\"alice@contoso.example\",\"userPrincipalName\":\"alice@contoso.example\",\"preferredLanguage\":\"en-GB\"}")
+		})
+		try mux.handle("GET /graph/me/photo/$value", def (ctx Context) !none {
+			return try ctx.blob(200, "image/jpeg", [byte(0xff), byte(0xd8), byte(0xff)])
+		})
+		try mux.handle("/", op.handler())
+		let site = new httptest.Server(mux)
+		try site.start()
+		server.issuer = site.url + "/tid-1/v2.0"
+		server.loginURL = site.url + "/login"
+		let m = new oauth2.ClientMetadata()
+		m.redirectUris = [site.url + "/cb"]
+		m.grantTypes = ["authorization_code", "refresh_token", "client_credentials", "urn:ietf:params:oauth:grant-type:jwt-bearer"]
+		let c = new oauth2.RegisteredClient("app", m)
+		c.secret = "app-secret"
+		try server.clients.save(c)
+		let e = new FakeEntra(site, op)
+		holder = e
+		return e
+	}
+
+	// certifiedClient registers "cert-app" with a certificate's key and
+	// returns the certificate.
+	internal def certifiedClient(e FakeEntra) !KeyPair {
+		let key PrivateKey = try generateECDSAKey(p256)
+		let template = x509.Template{notBefore: time.now() - 1h, notAfter: time.now() + 24h}
+		template.subject.commonName = "cert-app"
+		let pair = new KeyPair([try x509.createCertificate(template, publicKeyOf(key), none, key)], key)
+		let m = new oauth2.ClientMetadata()
+		m.redirectUris = [e.site.url + "/cb"]
+		m.grantTypes = ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:jwt-bearer"]
+		m.tokenEndpointAuthMethod = "private_key_jwt"
+		m.jwks = new jose.JwkSet([new jose.Jwk(publicKeyOf(key))])
+		try e.op.server.clients.save(new oauth2.RegisteredClient("cert-app", m))
+		return pair
+	}
+
+	check "Sign in with Microsoft" {
+		@test()
+		def TestSignIn() !none {
+			let e = try fakeEntra()
+			let microsoft = e.provider(allowedTenants = ["tid-1"])
+			let start = try microsoft.start(["api://downstream/read"], SignInOptions{prompt: Prompt.SelectAccount, loginHint: "alice@contoso.example", domainHint: "organizations"})
+			for let part in ["scope=openid+profile+email+offline_access+User.Read+api", "prompt=select_account", "login_hint=alice%40contoso.example", "domain_hint=organizations", "code_challenge_method=S256"] {
+				assert start.url.contains(part)
+			}
+			let login = try microsoft.exchange(start, try e.signIn(start.url))
+			// The provider serves a handler written for any provider.
+			let generic openid.SignInProvider = microsoft
+			assert (try generic.start()).url.contains("code_challenge=")
+			assert login.profile.id == "alice-oid" && "{login.claims.get("tid")}" == "tid-1"
+			assert orEmpty(login.profile.name) == "Alice Liddell"
+			// No email claim: the UPN stands in, unverified.
+			assert orEmpty(login.profile.email) == "alice@contoso.example" && !login.profile.emailVerified
+			let fresh = try microsoft.refresh(login)
+			assert fresh.claims.subject == "alice-oid" && orEmpty(fresh.profile.email) == "alice@contoso.example"
+			// Refresh tokens rotate: the old one is spent.
+			assert microsoft.tokenFor(login, ["User.Read"]) is error
+			let other = try microsoft.tokenFor(fresh, ["User.Read"])
+			assert other.accessToken.reveal() != fresh.token.accessToken.reveal()
+		}
+
+		@test()
+		def TestTenants() !none {
+			let e = try fakeEntra()
+			// A tenant not allowed.
+			let strict = e.provider(allowedTenants = ["tid-9"])
+			let start = try strict.start()
+			assert exchangeFailure(strict, start, try e.signIn(start.url)) == oauth2.OAuthErrorKind.AccessDenied.value
+			// An ID token whose tid does not match its issuer's tenant.
+			e.tid = "tid-2"
+			let open = e.provider()
+			let again = try open.start()
+			assert exchangeFailure(open, again, try e.signIn(again.url)) == oauth2.OAuthErrorKind.InvalidToken.value
+			// A single-tenant app reads its tenant's own issuer.
+			e.tid = "tid-1"
+			let single = e.provider(tenant = "tid-1")
+			let third = try single.start()
+			assert (try single.exchange(third, try e.signIn(third.url))).profile.id == "alice-oid"
+		}
+
+		@test()
+		def TestGraph() !none {
+			let e = try fakeEntra()
+			let microsoft = e.provider()
+			let start = try microsoft.start()
+			let login = try microsoft.exchange(start, try e.signIn(start.url))
+			let me = try microsoft.me(login)
+			assert orEmpty(me.name) == "Alice Liddell" && orEmpty(me.locale) == "en-GB" && orEmpty(me.email) == "alice@contoso.example"
+			let photo = try microsoft.photo(login)
+			assert !(photo is none) && photo.len() == 3
+			let anonymous = new openid.Login(new oauth2.Token(""), "", new openid.IdClaims())
+			assert microsoft.me(anonymous) is error
+		}
+
+		@test()
+		def TestCertificateAndOnBehalfOf() !none {
+			let e = try fakeEntra()
+			let pair = try certifiedClient(e)
+			let microsoft = new Provider("cert-app", certificate = pair, redirectURL = e.site.url + "/cb", authority = e.site.url, httpClient = e.site.client())
+			let start = try microsoft.start()
+			let login = try microsoft.exchange(start, try e.signIn(start.url))
+			assert login.profile.id == "alice-oid"
+			let form = e.tokenForms[e.tokenForms.len() - 1]
+			assert at(form, "client_assertion_type") == "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+			assert !form.hasKey("client_secret")
+			let header = try jose.parseJws(at(form, "client_assertion"))
+			let thumbprint = header.signatures[0].protected.x5tS256
+			assert !(thumbprint is none) && thumbprint.equals(digest(Hash.SHA256, pair.chain[0]))
+			// On behalf of the user, for another API.
+			let downstream = try microsoft.onBehalfOf("token-for-app", ["api://downstream/read"])
+			assert downstream.accessToken.reveal() != ""
+			let obo = e.tokenForms[e.tokenForms.len() - 1]
+			assert at(obo, "requested_token_use") == "on_behalf_of" && at(obo, "grant_type") == "urn:ietf:params:oauth:grant-type:jwt-bearer"
+			assert microsoft.onBehalfOf("someone-elses-token", ["api://downstream/read"]) is error
+		}
+
+		@test()
+		def TestAppToken() !none {
+			let e = try fakeEntra()
+			let microsoft = e.provider(tenant = "tid-1")
+			let token = try microsoft.appToken(["https://graph.example/.default"])
+			assert token.accessToken.reveal() != ""
+			assert at(e.tokenForms[0], "grant_type") == "client_credentials"
+		}
+
+		@test()
+		def TestLiveIdToken() !none {
+			return none when liveIdToken == "" || liveClientId == ""
+			let microsoft = new Provider(liveClientId)
+			assert (try microsoft.verifyIdToken(liveIdToken)).subject != ""
+		}
+
+		@test()
+		def TestNationalClouds() !none {
+			assert new Provider("app").graph == "https://graph.microsoft.com/v1.0"
+			assert new Provider("app", authority = "https://login.microsoftonline.us").graph == "https://graph.microsoft.us/v1.0"
+			assert new Provider("app", authority = "https://login.chinacloudapi.cn/").graph == "https://microsoftgraph.chinacloudapi.cn/v1.0"
+		}
+	}
+
+	internal def failureKind(err error) oauth2.OAuthErrorKind {
+		return err is oauth2.OAuthError ?? (err.kind, oauth2.OAuthErrorKind.Other)
+	}
+
+	// exchangeFailure is the error code exchange fails with ("ok" when it
+	// does not fail; "other" for an error that is not an OAuth error).
+	internal def exchangeFailure(microsoft Provider, start oauth2.AuthorizationRequest, callback string) string {
+		microsoft.exchange(start, callback) onerror (err error) {
+			return failureKind(err).value
+		}
+		return "ok"
+	}
+
+	internal def at(form map<string, string>, name string) string {
+		let v = form.get(name)
+		return v is none ?? ("", v)
+	}
+
+	internal def orEmpty(text ?string) string {
+		return text is none ?? ("", text)
+	}
+}

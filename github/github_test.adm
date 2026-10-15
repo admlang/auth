@@ -1,0 +1,243 @@
+partial module adm.auth.github {
+	use (
+		std.time
+		std.testing
+		std.net.http
+		std.net.http::(Context, ServeMux, Request)
+		std.net.http.httptest
+		std.net.url::(parseQuery)
+		std.proto.auth.oauth2
+		std.proto.auth.openid
+	)
+
+	// A token of a real GitHub account, to read its profile.
+	@env("ADM_TEST_GITHUB_TOKEN")
+	internal const liveToken string
+
+	internal type StopRedirects {
+		def new() {}
+
+		def follow(next Request, via Request[]) !bool {
+			return false
+		}
+	}
+
+	// A loopback GitHub Enterprise Server: its OAuth endpoints answer
+	// errors with 200 as GitHub does, and its API serves one user.
+	internal type FakeGitHub {
+		site      httptest.Server
+		browser   http.Client
+		// The access tokens issued and not revoked.
+		live      string[]        = []
+		// Device-flow polls answered with authorization_pending so far.
+		pending   int             = 0
+		issued    int             = 0
+		// Issue GitHub App user tokens, which expire and refresh.
+		appTokens bool            = false
+
+		def new(site httptest.Server) {
+			self.site = site
+			browser = site.client()
+			browser.redirects = new StopRedirects()
+		}
+
+		// signIn follows the authorization URL as a signed-in browser and
+		// returns the callback URL.
+		def signIn(authorizationURL string) !string {
+			let res = try browser.get(authorizationURL)
+			assert res.status == 302
+			return res.header("Location")
+		}
+
+		def provider(organizations string[] = []) Provider {
+			return new Provider("Iv1.app", "app-secret", redirectURL = site.url + "/cb", url = site.url, organizations = organizations, httpClient = site.client())
+		}
+
+		def issue(withRefresh bool) string {
+			issued++
+			let token = "ghu_{issued}"
+			live.push(token)
+			return withRefresh ?? ("\{\"access_token\":\"{token}\",\"token_type\":\"bearer\",\"scope\":\"\",\"expires_in\":28800,\"refresh_token\":\"ghr_{issued}\",\"refresh_token_expires_in\":15724800}", "\{\"access_token\":\"{token}\",\"token_type\":\"bearer\",\"scope\":\"read:user,user:email,read:org\"}")
+		}
+	}
+
+	internal def fakeGitHub() !FakeGitHub {
+		let holder ?FakeGitHub = none
+		let mux = new ServeMux()
+		try mux.handle("GET /login/oauth/authorize", def (ctx Context) !none {
+			assert ctx.query("client_id", "") == "Iv1.app" && ctx.query("code_challenge_method", "") == "S256"
+			return try ctx.redirect(ctx.query("redirect_uri", "") + "?code=good-code&state=" + ctx.query("state", ""), 302)
+		})
+		try mux.handle("POST /login/device/code", def (ctx Context) !none {
+			return try ctx.text("\{\"device_code\":\"dev-1\",\"user_code\":\"WDJB-MJHT\",\"verification_uri\":\"https://github.com/login/device\",\"expires_in\":900,\"interval\":0}")
+		})
+		try mux.handle("POST /login/oauth/access_token", def (ctx Context) !none {
+			let g = holder
+			fail "no fake" when g is none
+			let form = try parseQuery(try ctx.text())
+			let grant = form.get("grant_type")
+			let kind = grant is none ?? ("", grant)
+			assert ctx.header("Accept") == "application/json"
+			if kind == "urn:ietf:params:oauth:grant-type:device_code" {
+				if g.pending < 1 {
+					g.pending++
+					return try ctx.text("\{\"error\":\"authorization_pending\",\"error_description\":\"The authorization request is still pending.\"}")
+				}
+				return try ctx.text(g.issue(false))
+			}
+			let secret = form.get("client_secret")
+			return try ctx.text("\{\"error\":\"incorrect_client_credentials\"}") unless !(secret is none) && secret == "app-secret"
+			if kind == "refresh_token" {
+				let r = form.get("refresh_token")
+				return try ctx.text("\{\"error\":\"bad_refresh_token\"}") unless !(r is none) && r.startsWith("ghr_")
+				return try ctx.text(g.issue(true))
+			}
+			let code = form.get("code")
+			let verifier = form.get("code_verifier")
+			return try ctx.text("\{\"error\":\"bad_verification_code\",\"error_description\":\"The code passed is incorrect or expired.\"}") unless !(code is none) && code == "good-code" && !(verifier is none)
+			return try ctx.text(g.issue(g.appTokens))
+		})
+		let authorized = def (ctx Context) bool {
+			let g = holder
+			return false when g is none
+			let auth = ctx.header("Authorization")
+			return auth.startsWith("Bearer ") && auth["Bearer ".len():] in g.live
+		}
+		try mux.handle("GET /api/v3/user", def (ctx Context) !none {
+			return try ctx.text(401, "\{\"message\":\"Bad credentials\"}") unless authorized(ctx)
+			assert ctx.header("X-GitHub-Api-Version") == "2022-11-28"
+			return try ctx.text("\{\"login\":\"octocat\",\"id\":583231,\"avatar_url\":\"https://avatars.example/u/583231\",\"html_url\":\"https://github.example/octocat\",\"name\":null,\"email\":\"public@octocat.example\"}")
+		})
+		try mux.handle("GET /api/v3/user/emails", def (ctx Context) !none {
+			return try ctx.text(401, "\{\"message\":\"Bad credentials\"}") unless authorized(ctx)
+			return try ctx.text("[\{\"email\":\"public@octocat.example\",\"primary\":false,\"verified\":true},\{\"email\":\"octocat@github.example\",\"primary\":true,\"verified\":true}]")
+		})
+		try mux.handle("GET /api/v3/user/memberships/orgs/\{org}", def (ctx Context) !none {
+			return try ctx.text(401, "\{\"message\":\"Bad credentials\"}") unless authorized(ctx)
+			let org = ctx.param("org")
+			return try ctx.text("\{\"state\":\"active\",\"role\":\"member\"}") when org == "adm-lang"
+			return try ctx.text("\{\"state\":\"pending\",\"role\":\"member\"}") when org == "invited"
+			return try ctx.text(404, "\{\"message\":\"Not Found\"}")
+		})
+		try mux.handle("/api/v3/applications/\{client}/token", def (ctx Context) !none {
+			let g = holder
+			fail "no fake" when g is none
+			return try ctx.text(401, "\{\"message\":\"Requires authentication\"}") unless ctx.param("client") == "Iv1.app" && ctx.header("Authorization") == "Basic SXYxLmFwcDphcHAtc2VjcmV0"
+			let body = try ctx.text()
+			let token = body.split("\"access_token\":\"")[1].split("\"")[0]
+			return try ctx.text(404, "\{\"message\":\"Not Found\"}") unless token in g.live
+			if ctx.method() == http.Method.DELETE {
+				g.live = g.live.filter(t => t != token)
+				return try ctx.noContent(204)
+			}
+			return try ctx.text("\{\"token\":\"{token}\",\"scopes\":[\"read:user\"],\"user\":\{\"login\":\"octocat\",\"id\":583231,\"name\":\"The Octocat\"}}")
+		})
+		let site = new httptest.Server(mux)
+		try site.start()
+		let g = new FakeGitHub(site)
+		holder = g
+		return g
+	}
+
+	check "Sign in with GitHub" {
+		@test()
+		def TestSignIn() !none {
+			let g = try fakeGitHub()
+			let github = g.provider(organizations = ["invited", "adm-lang"])
+			assert github.api == g.site.url + "/api/v3"
+			let start = try github.start(["repo"], SignInOptions{login: "octocat", allowSignup: false})
+			for let part in ["scope=read%3Auser+user%3Aemail+read%3Aorg+repo", "login=octocat", "allow_signup=false", "code_challenge="] {
+				assert start.url.contains(part)
+			}
+			let login = try github.exchange(start, try g.signIn(start.url))
+			// The provider serves a handler written for any provider.
+			let generic openid.SignInProvider = github
+			assert (try generic.start()).url.contains("code_challenge=")
+			let p = login.profile
+			assert p.id == "583231" && orEmpty(p.name) == "octocat"
+			assert orEmpty(p.email) == "octocat@github.example" && p.emailVerified
+			assert orEmpty(p.picture) == "https://avatars.example/u/583231"
+			assert login.token.scope.join(" ") == "read:user user:email read:org"
+			assert login.claims.subject == "583231" && orEmpty(login.claims.preferredUsername) == "octocat"
+			assert login.idToken == ""
+			// An OAuth app token has no refresh token.
+			assert github.refresh(login) is error
+		}
+
+		@test()
+		def TestRefusals() !none {
+			let g = try fakeGitHub()
+			let github = g.provider(organizations = ["invited", "elsewhere"])
+			let start = try github.start()
+			assert exchangeFailure(github, start, try g.signIn(start.url)) == oauth2.OAuthErrorKind.AccessDenied.value
+			// GitHub reports a bad code with status 200.
+			let open = g.provider()
+			let again = try open.start()
+			let callback = (try g.signIn(again.url)).replace("good-code", "stale-code")
+			assert exchangeFailure(open, again, callback) == oauth2.OAuthErrorKind.Other.value
+			assert exchangeFailure(open, again, (try g.signIn(again.url)).replace("state=", "state=x")) == oauth2.OAuthErrorKind.StateMismatch.value
+			// The user declined.
+			assert exchangeFailure(open, again, g.site.url + "/cb?error=access_denied&state=" + again.state) == oauth2.OAuthErrorKind.AccessDenied.value
+		}
+
+		@test()
+		def TestDeviceFlow() !none {
+			let g = try fakeGitHub()
+			let cli = new Provider("Iv1.app", url = g.site.url, httpClient = g.site.client())
+			let device = try cli.startDevice(["repo"])
+			assert device.code == "WDJB-MJHT" && device.url == "https://github.com/login/device"
+			assert time.now().before(device.expires)
+			let login = try device.wait()
+			assert g.pending == 1
+			assert login.profile.id == "583231"
+		}
+
+		@test()
+		def TestAppTokens() !none {
+			let g = try fakeGitHub()
+			g.appTokens = true
+			let github = g.provider()
+			let start = try github.start()
+			let login = try github.exchange(start, try g.signIn(start.url))
+			assert !(login.token.refreshToken is none) && !(login.token.expiresAt is none)
+			// A GitHub App token lists no scopes; the emails are read anyway.
+			assert orEmpty(login.profile.email) == "octocat@github.example"
+			let fresh = try github.refresh(login)
+			assert fresh.token.accessToken.reveal() != login.token.accessToken.reveal()
+			assert fresh.profile.id == "583231"
+			let checked = try github.checkToken(fresh.token.accessToken)
+			assert !(checked is none) && orEmpty(checked.name) == "The Octocat"
+			try github.revoke(fresh)
+			assert (try github.checkToken(fresh.token.accessToken)) is none
+			assert github.profile(fresh.token) is error
+			// Without the secret the applications API cannot be used.
+			let cli = new Provider("Iv1.app", url = g.site.url, httpClient = g.site.client())
+			assert cli.checkToken(login.token.accessToken) is error
+		}
+
+		@test()
+		def TestLiveProfile() !none {
+			return none when liveToken == ""
+			let github = new Provider("live")
+			let p = try github.profile(new oauth2.Token(liveToken))
+			assert p.id != ""
+		}
+	}
+
+	internal def failureKind(err error) oauth2.OAuthErrorKind {
+		return err is oauth2.OAuthError ?? (err.kind, oauth2.OAuthErrorKind.Other)
+	}
+
+	// exchangeFailure is the error code exchange fails with ("ok" when it
+	// does not fail; "other" for an error that is not an OAuth error).
+	internal def exchangeFailure(github Provider, start oauth2.AuthorizationRequest, callback string) string {
+		github.exchange(start, callback) onerror (err error) {
+			return failureKind(err).value
+		}
+		return "ok"
+	}
+
+	internal def orEmpty(text ?string) string {
+		return text is none ?? ("", text)
+	}
+}

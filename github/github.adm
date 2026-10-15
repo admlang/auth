@@ -1,3 +1,404 @@
+// Sign in with GitHub over std.proto.auth.oauth2. GitHub has no OpenID
+// Connect: the library completes the OAuth flow and reads who signed in
+// from the REST API (`/user`, `/user/emails`). It also runs the device
+// flow for command-line tools, renews GitHub App user tokens, checks
+// organisation membership, and talks to GitHub Enterprise Server through
+// `url`.
+//
+// ```
+// let github = new github.Provider(clientId, clientSecret, redirectURL = "https://example.com/auth/github")
+// let request = try github.start()
+// // send the browser to request.url, keep request with the session; at the callback:
+// let login = try github.exchange(request, callbackURL)
+// print(login.profile.email)   // the primary verified address
+// ```
 partial module adm.auth.github {
-	// Sign in with GitHub over std.proto.auth.oauth2: the authorization code flow (GitHub has no OpenID Connect), the device flow, user and email lookup for a Profile, GitHub App user tokens with refresh, GitHub Enterprise base URLs
+	use (
+		std.time
+		std.net.http
+		std.net.http::(Request, Response, Method, newRequest)
+		std.net.url::(pathEscape)
+		std.data.encoding::(JSON, Base64)
+		std.proto.auth.oauth2
+		std.proto.auth.openid::(Login, IdClaims, Profile)
+	)
+
+	// github.com.
+	const githubURL = "https://github.com"
+
+	// github.com's REST API.
+	const githubAPI = "https://api.github.com"
+
+	// The REST API version every request names.
+	const apiVersion = "2022-11-28"
+
+	// The scopes a sign-in asks for to read the profile and the emails.
+	const signInScopes = ["read:user", "user:email"]
+
+	// SignInOptions adjust one sign-in.
+	struct SignInOptions {
+		// The account to suggest on the sign-in page.
+		login         ?string
+		// Show the account picker even when one account is signed in.
+		selectAccount bool    = false
+		// Offer to create an account on the sign-in page.
+		allowSignup   bool    = true
+	}
+
+	// Provider signs users in with one GitHub OAuth app or GitHub App.
+	// Safe to use from several tasks.
+	type Provider {
+		clientId       string
+		clientSecret   ?Secret<string>
+		// Where GitHub sends the browser back to; registered with the app.
+		redirectURL    string
+		// GitHub's address: github.com, or a GitHub Enterprise Server such
+		// as "https://github.example.com" (its API is at /api/v3).
+		url            string
+		// The REST API the profile comes from; derived from url.
+		api            string
+		// Organisations (logins) of which the user must be an active
+		// member, any one of them; empty accepts everyone. Adds the
+		// `read:org` scope.
+		organizations  string[]        = []
+		httpClient     ?http.Client
+		internal oauth oauth2.Client
+
+		def new(clientId string, clientSecret ?Secret<string> = none, redirectURL string = "", url string = githubURL, organizations string[] = [], httpClient ?http.Client = none) {
+			self.clientId = clientId
+			self.clientSecret = clientSecret
+			self.redirectURL = redirectURL
+			self.url = url.trimSuffix("/")
+			self.organizations = organizations
+			self.httpClient = httpClient
+			api = self.url == githubURL ?? (githubAPI, self.url + "/api/v3")
+			let server = new oauth2.ServerMetadata(self.url)
+			server.authorizationEndpoint = self.url + "/login/oauth/authorize"
+			server.tokenEndpoint = self.url + "/login/oauth/access_token"
+			server.deviceAuthorizationEndpoint = self.url + "/login/device/code"
+			oauth = new oauth2.Client(clientId, server)
+			oauth.secret = clientSecret
+			// GitHub takes the secret in the body; a device-flow client has none.
+			oauth.authentication = clientSecret is none ?? (oauth2.ClientAuthentication.None, oauth2.ClientAuthentication.SecretPost)
+			oauth.httpClient = httpClient
+		}
+
+		// start begins a sign-in for the profile and email scopes plus
+		// scopes (such as "repo"). Fails only when no random state can be
+		// drawn.
+		def start(scopes string[] = []) !oauth2.AuthorizationRequest {
+			return try start(scopes, SignInOptions{})
+		}
+
+		// start begins a sign-in with options. Fails as above.
+		def start(scopes string[], options SignInOptions) !oauth2.AuthorizationRequest {
+			let auth = oauth2.AuthorizationOptions{}
+			let suggested = options.login
+			auth.extra.set("login", suggested) unless suggested is none
+			auth.prompt = "select_account" when options.selectAccount
+			auth.extra.set("allow_signup", "false") unless options.allowSignup
+			return try oauth.authorize(redirectURL, allScopes(scopes), auth)
+		}
+
+		// exchange finishes a sign-in from the callback URL and reads the
+		// profile. Fails with the error GitHub put in the callback (such as
+		// AccessDenied), StateMismatch, InvalidGrant for a used or expired
+		// code, AccessDenied when the user is in none of organizations, and
+		// as the API does.
+		def exchange(request oauth2.AuthorizationRequest, callback string) !Login {
+			return try signedIn(try oauth.exchange(request, callback))
+		}
+
+		// refresh renews a GitHub App user token (they expire after eight
+		// hours); the profile stays the one of the sign-in. Fails with
+		// Malformed for an OAuth app token, which does not expire and has
+		// no refresh token, InvalidGrant for an expired refresh token, and
+		// as the token request does.
+		def refresh(login Login) !Login {
+			let fresh = new Login(fixScopes(try oauth.refresh(login.token)), "", login.claims)
+			fresh.profile = login.profile
+			return fresh
+		}
+
+		// startDevice begins the device flow, for a program without a
+		// browser: show the user `url` and `code`, then wait. The app must
+		// have the device flow enabled. Fails as the device request does.
+		def startDevice(scopes string[] = []) !DeviceSignIn {
+			let complete = def (started oauth2.DeviceAuthorization) !Login {
+				return try signedIn(try oauth.poll(started))
+			}
+			return new DeviceSignIn(try oauth.deviceAuthorization(allScopes(scopes)), complete)
+		}
+
+		// profile reads who a token belongs to: id, login as the fallback
+		// name, avatar, and the primary verified email when the token may
+		// read emails. Fails with InvalidToken for a revoked token, and as
+		// the API does.
+		def profile(token oauth2.Token) !Profile {
+			let user = try getObject(token, "/user")
+			return try profileOf(user, token)
+		}
+
+		// checkToken asks GitHub whether a token of this app is still
+		// valid; none when it is not. Needs the client secret. Fails as the
+		// API does.
+		def checkToken(token Secret<string>) !?Profile {
+			let res = try appRequest(Method.POST, token)
+			return none when res.status := 404 || 422
+			let text = try res.text()
+			fail apiError(res.status, text) unless res.status == 200
+			let user = objectAt(try parseObject(text), "user")
+			return user is none ?? (none, try profileOf(user, none))
+		}
+
+		// revoke revokes a sign-in's token. Needs the client secret. Fails
+		// as the API does.
+		def revoke(login Login) !none {
+			let res = try appRequest(Method.DELETE, login.token.accessToken)
+			fail apiError(res.status, try res.text()) unless res.status := 204 || 404
+			return none
+		}
+
+		// signedIn reads the profile of a fresh token and checks the
+		// organisations.
+		internal def signedIn(token oauth2.Token) !Login {
+			let fixed = fixScopes(token)
+			let user = try getObject(fixed, "/user")
+			let profile = try profileOf(user, fixed)
+			if organizations.len() > 0 {
+				let member = false
+				for let org in organizations {
+					member = try isActiveMember(fixed, org)
+					break when member
+				}
+				fail refused("{profile.raw.get("login")} is not a member of {organizations.join(", ")}") unless member
+			}
+			let claims = new IdClaims()
+			claims.subject = profile.id
+			claims.issuer = url
+			claims.audience = [clientId]
+			claims.name = profile.name
+			claims.email = profile.email
+			claims.emailVerified = profile.emailVerified
+			claims.picture = profile.picture
+			let loginName = textAt(user, "login")
+			claims.preferredUsername = loginName
+			claims.profile = textAt(user, "html_url")
+			let login = new Login(fixed, "", claims)
+			login.profile = profile
+			return login
+		}
+
+		internal def profileOf(user map<string, any>, token ?oauth2.Token) !Profile {
+			let id = numberAt(user, "id")
+			fail apiError(200, "the user has no id") when id == ""
+			let p = new Profile(id)
+			let loginName = textAt(user, "login")
+			let fullName = textAt(user, "name")
+			p.name = fullName is none ?? (loginName, fullName)
+			p.picture = textAt(user, "avatar_url")
+			p.raw = user
+			// The public email of /user is not known to be verified.
+			p.email = textAt(user, "email")
+			if !(token is none) && canReadEmails(token) {
+				let emails = try getArray(token, "/user/emails")
+				for let e in emails {
+					continue unless e is map<string, any>
+					let primary = e.get("primary")
+					let verified = e.get("verified")
+					if primary is bool && primary {
+						p.email = textAt(e, "email")
+						p.emailVerified = verified is bool && verified
+					}
+				}
+			}
+			return p
+		}
+
+		// isActiveMember asks whether the user is an active member of org;
+		// a pending invitation is not membership.
+		internal def isActiveMember(token oauth2.Token, org string) !bool {
+			let res = try get(token, "/user/memberships/orgs/" + pathEscape(org))
+			let text = try res.text()
+			return false when res.status := 404 || 403
+			fail apiError(res.status, text) unless res.status == 200
+			let state = textAt(try parseObject(text), "state")
+			return !(state is none) && state == "active"
+		}
+
+		internal def get(token oauth2.Token, path string) !Response {
+			let req = try newRequest(Method.GET, api + path)
+			setHeaders(req)
+			return oauth.send(req, token) onerror (err error) {
+				fail transportError(api + path, err)
+			}
+		}
+
+		internal def getObject(token oauth2.Token, path string) !map<string, any> {
+			let res = try get(token, path)
+			let text = try res.text()
+			fail apiError(res.status, text) unless res.status == 200
+			return try parseObject(text)
+		}
+
+		internal def getArray(token oauth2.Token, path string) !any[] {
+			let res = try get(token, path)
+			let text = try res.text()
+			fail apiError(res.status, text) unless res.status == 200
+			let parsed = parseJson(text) onerror fail malformed("{path} did not answer JSON")
+			fail malformed("{path} did not answer an array") unless parsed is any[]
+			let out any[] = []
+			out = parsed when parsed is any[]
+			return out
+		}
+
+		// appRequest calls the applications API on a token, with the app's
+		// credentials.
+		internal def appRequest(method Method, token Secret<string>) !Response {
+			let secret = clientSecret
+			fail malformed("the applications API needs the client secret") when secret is none
+			let target = api + "/applications/" + pathEscape(clientId) + "/token"
+			let body = new map<string, any>()
+			body.set("access_token", token.reveal())
+			let req = try newRequest(method, target, new JSON().encode(body))
+			setHeaders(req)
+			req.headers.set("Content-Type", "application/json")
+			req.headers.set("Authorization", "Basic " + new Base64().encode("{clientId}:{secret.reveal()}".bytes()))
+			return client().do(req) onerror (err error) {
+				fail transportError(target, err)
+			}
+		}
+
+		internal def client() http.Client {
+			let given = httpClient
+			return given is none ?? (new http.Client(), given)
+		}
+
+		internal def allScopes(scopes string[]) string[] {
+			let all string[] = []
+			for let s in signInScopes {
+				all.push(s)
+			}
+			all.push("read:org") when organizations.len() > 0
+			for let s in scopes {
+				all.push(s) unless s in all
+			}
+			return all
+		}
+	}
+
+	// DeviceSignIn is a started device flow: show `url` and `code` to the
+	// user, then wait.
+	type DeviceSignIn {
+		// The page where the user enters the code.
+		url               string
+		// The code to enter, such as "WDJB-MJHT".
+		code              string
+		expires           time.Time
+		internal started  oauth2.DeviceAuthorization
+		internal complete def (oauth2.DeviceAuthorization) !Login
+
+		def new(started oauth2.DeviceAuthorization, complete def (oauth2.DeviceAuthorization) !Login) {
+			self.started = started
+			self.complete = complete
+			url = started.verificationUri
+			code = started.userCode
+			expires = started.expiresAt
+		}
+
+		// wait polls GitHub at the pace it asks for until the user enters
+		// the code, then reads the profile. Fails with AccessDenied when
+		// the user declines, ExpiredToken when the code expires first, and
+		// as exchange does.
+		def wait() !Login {
+			return try complete(started)
+		}
+	}
+
+	internal def setHeaders(req Request) {
+		req.headers.set("Accept", "application/vnd.github+json")
+		req.headers.set("X-GitHub-Api-Version", apiVersion)
+		req.headers.set("User-Agent", "adm.auth.github")
+	}
+
+	// fixScopes splits the comma-separated scope list GitHub returns.
+	internal def fixScopes(token oauth2.Token) oauth2.Token {
+		let scopes string[] = []
+		for let s in token.scope {
+			for let part in s.split(",") {
+				let p = part.trim()
+				scopes.push(p) unless p == ""
+			}
+		}
+		token.scope = scopes
+		return token
+	}
+
+	// canReadEmails reports whether a token's scopes reach /user/emails.
+	internal def canReadEmails(token oauth2.Token) bool {
+		// GitHub App user tokens list no scopes; their permissions decide.
+		return token.scope.len() == 0 || "user:email" in token.scope || "user" in token.scope
+	}
+
+	internal def parseJson(text string) !any {
+		return try new JSON().parse(text)
+	}
+
+	internal def parseObject(text string) !map<string, any> {
+		let parsed = parseJson(text) onerror fail malformed("the answer is not JSON")
+		let m = new map<string, any>()
+		m = parsed when parsed is map<string, any>
+		fail malformed("the answer is not a JSON object") unless parsed is map<string, any>
+		return m
+	}
+
+	internal def objectAt(m map<string, any>, name string) ?map<string, any> {
+		let v = m.get(name)
+		return v is map<string, any> ?? (v, none)
+	}
+
+	internal def textAt(m map<string, any>, name string) ?string {
+		let v = m.get(name)
+		return v is string ?? (v, none)
+	}
+
+	internal def numberAt(m map<string, any>, name string) string {
+		let v = m.get(name)
+		match v {
+			case int:
+				return "{v}"
+			case string:
+				return v
+			default:
+				return ""
+		}
+	}
+
+	// apiError is a failed REST call: 401 is an invalid token, 403 and 404
+	// are access the token lacks.
+	internal def apiError(status int, body string) error {
+		let message = body
+		let parsed = parseJson(body) onerror recover none
+		if parsed is map<string, any> {
+			let m = textAt(parsed, "message")
+			message = m unless m is none
+		}
+		let kind = oauth2.OAuthErrorKind.ServerError
+		kind = oauth2.OAuthErrorKind.InvalidToken when status == 401
+		kind = oauth2.OAuthErrorKind.AccessDenied when status := 403 || 404
+		kind = oauth2.OAuthErrorKind.Malformed when status == 200
+		return oauth2.OAuthError{message: "github: {message}", code: kind.value, kind: kind, description: message, status: status}
+	}
+
+	internal def transportError(target string, err error) error {
+		return oauth2.OAuthError{message: "github: cannot reach {target}: {err.message}", code: oauth2.OAuthErrorKind.Transport.value, cause: err, kind: oauth2.OAuthErrorKind.Transport}
+	}
+
+	internal def malformed(text string) error {
+		return oauth2.OAuthError{message: "github: " + text, code: oauth2.OAuthErrorKind.Malformed.value, kind: oauth2.OAuthErrorKind.Malformed, description: text}
+	}
+
+	internal def refused(text string) error {
+		return oauth2.OAuthError{message: "github: " + text, code: oauth2.OAuthErrorKind.AccessDenied.value, kind: oauth2.OAuthErrorKind.AccessDenied, description: text}
+	}
 }

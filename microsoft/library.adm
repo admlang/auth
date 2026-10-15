@@ -1,5 +1,5 @@
 // Sign in with Microsoft (Entra ID)
-@manifest(version = "0.0.1")
+@manifest(version = "0.1.0")
 library adm.auth.microsoft {
 	use (
 		adm.auth.microsoft

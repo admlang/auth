@@ -13,14 +13,14 @@ adm get admlang:adm.auth.github
 use adm.auth.github
 
 let provider = new github.Provider(clientId, clientSecret, redirectURL = "https://example.com/auth/github")
-let start = try provider.begin(scopes = ["read:user", "user:email"])
-let login = try provider.complete(callbackURL, start)
+let request = try provider.start()              // read:user and user:email
+let login = try provider.exchange(request, callbackURL)
 print(login.profile.email)                        // the primary verified address
 
 // a command-line tool
-let device = try provider.beginDevice(scopes = ["repo"])
+let device = try provider.startDevice(["repo"])
 print("Open {device.url} and enter {device.code}")
-let token = try device.wait()
+let signedIn = try device.wait()
 ```
 
 ## Tests

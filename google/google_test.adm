@@ -1,0 +1,233 @@
+partial module adm.auth.google {
+	use (
+		std.time
+		std.testing
+		std.net.http
+		std.net.http::(Context, ServeMux, Request)
+		std.net.http.httptest
+		std.proto.auth.jose
+		std.proto.auth.oauth2
+		std.proto.auth.openid
+	)
+
+	// A real ID token and the client it was issued to, to verify against
+	// Google's own keys.
+	@env("ADM_TEST_GOOGLE_ID_TOKEN")
+	internal const liveIdToken string
+
+	@env("ADM_TEST_GOOGLE_CLIENT_ID")
+	internal const liveClientId string
+
+	internal type StopRedirects {
+		def new() {}
+
+		def follow(next Request, via Request[]) !bool {
+			return false
+		}
+	}
+
+	// A loopback provider that answers as Google does: its login page
+	// signs in whoever `user` names, in the Workspace domain `domain`.
+	internal type FakeGoogle {
+		site    httptest.Server
+		op      openid.Provider
+		signing jose.Jwk
+		browser http.Client
+		user    string          = "alice"
+		domain  string          = "example.com"
+
+		def new(site httptest.Server, op openid.Provider, signing jose.Jwk) {
+			self.site = site
+			self.op = op
+			self.signing = signing
+			browser = site.client()
+			browser.redirects = new StopRedirects()
+		}
+
+		// signIn follows the authorization URL through the login page and
+		// returns the callback URL Google would send the browser to.
+		def signIn(authorizationURL string) !string {
+			let first = try browser.get(authorizationURL)
+			assert first.status == 303
+			let second = try browser.get(first.header("Location"))
+			assert second.status == 303
+			return second.header("Location")
+		}
+
+		// mint signs an ID token as Google does, with the given claims.
+		def mint(claims map<string, any>) !string {
+			let c = new jose.Claims()
+			c.issuedAt = time.now()
+			c.expires = time.now() + 1h
+			for let (name, value) in claims {
+				try c.set(name, value)
+			}
+			return try c.sign(signing)
+		}
+
+		def provider(offline bool = false, hostedDomain ?string = none) Provider {
+			return new Provider("web-app", "web-secret", redirectURL = site.url + "/cb", hostedDomain = hostedDomain, offline = offline, issuer = site.url, httpClient = site.client())
+		}
+	}
+
+	internal def fakeGoogle() !FakeGoogle {
+		let signing = try jose.generateKey(jose.SignatureAlgorithm.RS256)
+		signing.kid = "google-1"
+		let server = new oauth2.AuthorizationServer("http://placeholder", new jose.JwkSet([signing]))
+		let users = new openid.MemoryUserStore()
+		users.add("alice", map<string, any>{"name": "Alice Liddell", "email": "alice@example.com", "email_verified": true, "picture": "https://lh3.example/alice.png", "locale": "en-GB"})
+		users.add("mallory", map<string, any>{"name": "Mallory", "email": "mallory@other.example", "email_verified": true})
+		let op = new openid.Provider(server, users)
+		op.scopeClaimsInIdToken = true
+		let holder ?FakeGoogle = none
+		let mux = new ServeMux()
+		try mux.handle("/login", def (ctx Context) !none {
+			let g = holder
+			fail "no fake" when g is none
+			let id = ctx.query("request", "")
+			let claims map<string, any>
+			claims.set("hd", g.domain)
+			return try server.complete(ctx, id, oauth2.Decision{subject: g.user, claims: claims})
+		})
+		try mux.handle("/tokeninfo", def (ctx Context) !none {
+			return try ctx.text(400, "\{\"error\":\"invalid_token\"}") unless ctx.query("access_token", "") == "ya29.good"
+			return try ctx.text("\{\"aud\":\"web-app\",\"sub\":\"alice\",\"scope\":\"openid email\",\"exp\":\"1900000000\",\"expires_in\":\"3599\",\"email\":\"alice@example.com\"}")
+		})
+		try mux.handle("/", op.handler())
+		let site = new httptest.Server(mux)
+		try site.start()
+		server.issuer = site.url
+		server.loginURL = site.url + "/login"
+		for let id in ["web-app", "ios-app"] {
+			let m = new oauth2.ClientMetadata()
+			m.redirectUris = [site.url + "/cb"]
+			m.grantTypes = ["authorization_code", "refresh_token"]
+			let c = new oauth2.RegisteredClient(id, m)
+			c.secret = id == "web-app" ?? ("web-secret", "ios-secret")
+			try server.clients.save(c)
+		}
+		let g = new FakeGoogle(site, op, signing)
+		holder = g
+		return g
+	}
+
+	check "Sign in with Google" {
+		@test()
+		def TestSignIn() !none {
+			let g = try fakeGoogle()
+			let google = g.provider(offline = true, hostedDomain = "example.com")
+			let start = try google.start(["https://www.googleapis.com/auth/calendar.readonly"], SignInOptions{prompt: [Prompt.Consent, Prompt.SelectAccount], loginHint: "alice@example.com", includeGrantedScopes: true})
+			for let part in ["scope=openid+email+profile+https", "hd=example.com", "access_type=offline", "prompt=consent+select_account", "login_hint=alice%40example.com", "include_granted_scopes=true", "code_challenge_method=S256", "nonce="] {
+				assert start.url.contains(part)
+			}
+			let login = try google.exchange(start, try g.signIn(start.url))
+			// The provider serves a handler written for any provider.
+			let generic openid.SignInProvider = google
+			assert (try generic.start()).url.contains("code_challenge=")
+			let p = login.profile
+			assert p.id == "alice" && p.emailVerified
+			assert orEmpty(p.email) == "alice@example.com" && orEmpty(p.name) == "Alice Liddell"
+			assert orEmpty(p.picture) == "https://lh3.example/alice.png" && orEmpty(p.locale) == "en-GB"
+			assert "{login.claims.get("hd")}" == "example.com"
+			let fresh = try google.refresh(login)
+			assert fresh.claims.subject == "alice"
+			assert orEmpty(fresh.profile.email) == "alice@example.com"
+			let info = try google.userInfo(login)
+			assert orEmpty(info.name) == "Alice Liddell"
+			try google.revoke(fresh)
+			assert google.refresh(fresh) is error
+		}
+
+		@test()
+		def TestHostedDomain() !none {
+			let g = try fakeGoogle()
+			g.user = "mallory"
+			g.domain = "other.example"
+			let google = g.provider(hostedDomain = "example.com")
+			let start = try google.start()
+			assert exchangeFailure(google, start, try g.signIn(start.url)) == oauth2.OAuthErrorKind.AccessDenied.value
+			// Without a domain any account signs in.
+			let open = g.provider()
+			let again = try open.start()
+			assert (try open.exchange(again, try g.signIn(again.url))).profile.id == "mallory"
+		}
+
+		@test()
+		def TestVerifyIdToken() !none {
+			let g = try fakeGoogle()
+			let google = g.provider()
+			google.appClientIds = ["android-app", "ios-app"]
+			let bare = g.site.url.split("://")[1]
+			// One Tap: this client, the issuer without its scheme as Google
+			// sometimes writes it.
+			let oneTap = try g.mint(map<string, any>{"iss": bare, "aud": "web-app", "azp": "web-app", "sub": "alice", "email": "alice@example.com", "nonce": "n-1"})
+			let claims = try google.verifyIdToken(oneTap, nonce = "n-1")
+			assert claims.subject == "alice"
+			assert google.verifyIdToken(oneTap, nonce = "n-2") is error
+			// Android: the web client is the audience, the app the authorized party.
+			let android = try g.mint(map<string, any>{"iss": g.site.url, "aud": "web-app", "azp": "android-app", "sub": "alice"})
+			assert (try google.verifyIdToken(android)).subject == "alice"
+			let stranger = try g.mint(map<string, any>{"iss": g.site.url, "aud": "web-app", "azp": "someone-else", "sub": "alice"})
+			assert google.verifyIdToken(stranger) is error
+			// iOS: the app is the audience.
+			let ios = try g.mint(map<string, any>{"iss": g.site.url, "aud": "ios-app", "sub": "alice"})
+			assert (try google.verifyIdToken(ios, audience = "ios-app")).subject == "alice"
+			assert google.verifyIdToken(ios) is error
+			assert google.verifyIdToken(ios, audience = "unknown-app") is error
+			// Another issuer, an expired token, another key.
+			assert google.verifyIdToken(try g.mint(map<string, any>{"iss": "https://evil.example", "aud": "web-app", "sub": "alice"})) is error
+			assert google.verifyIdToken(try g.mint(map<string, any>{"iss": g.site.url, "aud": "web-app", "sub": "alice", "exp": 1000000000})) is error
+			let other = try jose.generateKey(jose.SignatureAlgorithm.RS256)
+			other.kid = "google-1"
+			let c = new jose.Claims()
+			c.issuer = g.site.url
+			c.audience = ["web-app"]
+			c.subject = "alice"
+			c.issuedAt = time.now()
+			c.expires = time.now() + 1h
+			assert google.verifyIdToken(try c.sign(other)) is error
+			// Hosted domain applies to verified tokens too.
+			google.hostedDomain = "example.com"
+			assert (try google.verifyIdToken(try g.mint(map<string, any>{"iss": g.site.url, "aud": "web-app", "sub": "alice", "hd": "example.com"}))).subject == "alice"
+			assert google.verifyIdToken(android) is error
+		}
+
+		@test()
+		def TestTokenInfo() !none {
+			let g = try fakeGoogle()
+			let google = g.provider()
+			let info = try google.tokenInfo("ya29.good")
+			assert info.audience == "web-app" && info.scopes.join(",") == "openid,email"
+			assert orEmpty(info.subject) == "alice" && orEmpty(info.email) == "alice@example.com"
+			assert info.expires.unixNs() == int64(1900000000) * 1000000000
+			assert google.tokenInfo("ya29.bad") is error
+		}
+
+		@test()
+		def TestLiveIdToken() !none {
+			return none when liveIdToken == "" || liveClientId == ""
+			let google = new Provider(liveClientId)
+			let claims = try google.verifyIdToken(liveIdToken)
+			assert claims.subject != ""
+		}
+	}
+
+	// failureKind is the OAuth error kind of a failure; Other for another
+	// error.
+	internal def failureKind(err error) oauth2.OAuthErrorKind {
+		return err is oauth2.OAuthError ?? (err.kind, oauth2.OAuthErrorKind.Other)
+	}
+
+	// exchangeFailure is the error code exchange fails with ("ok" when it
+	// does not fail; "other" for an error that is not an OAuth error).
+	internal def exchangeFailure(google Provider, start oauth2.AuthorizationRequest, callback string) string {
+		google.exchange(start, callback) onerror (err error) {
+			return failureKind(err).value
+		}
+		return "ok"
+	}
+
+	internal def orEmpty(text ?string) string {
+		return text is none ?? ("", text)
+	}
+}

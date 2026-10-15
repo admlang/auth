@@ -1,3 +1,351 @@
+// Sign in with Microsoft over std.proto.auth.openid: the Entra ID v2
+// endpoints for work and school accounts and personal Microsoft accounts,
+// tenants and their issuers, client secrets and certificates, the profile
+// from Microsoft Graph, tokens for other APIs, the on-behalf-of flow, and
+// the national clouds.
+//
+// ```
+// let microsoft = new microsoft.Provider(clientId, clientSecret, tenant = "organizations",
+// 	redirectURL = "https://example.com/auth/microsoft")
+// let request = try microsoft.start()
+// // send the browser to request.url, keep request with the session; at the callback:
+// let login = try microsoft.exchange(request, callbackURL)
+// print("{login.profile.name}, tenant {login.claims.get("tid")}")
+// ```
 partial module adm.auth.microsoft {
-	// Sign in with Microsoft over std.proto.auth.openid: Entra ID v2 endpoints by tenant (common, organizations, consumers or an id), per-tenant issuer validation, client secrets and certificates, Microsoft Graph for a Profile, on-behalf-of tokens
+	use (
+		std.time
+		std.net.http
+		std.net.http::(Response, Method, newRequest)
+		std.net.tls::(KeyPair)
+		std.crypto.hash::(Hash, digest)
+		std.data.encoding::(JSON)
+		std.proto.auth.jose
+		std.proto.auth.oauth2
+		std.proto.auth.openid
+		std.proto.auth.openid::(Login, IdClaims, Profile)
+	)
+
+	// The global cloud's sign-in address.
+	const globalAuthority = "https://login.microsoftonline.com"
+
+	// The tenant of personal Microsoft accounts.
+	const consumersTenantId = "9188040d-6c67-4c5b-b112-36a304b66dad"
+
+	// The scopes a sign-in asks for besides `openid`: the profile claims, a
+	// refresh token, and Microsoft Graph's /me.
+	const signInScopes = ["profile", "email", "offline_access", "User.Read"]
+
+	// What Microsoft shows before it signs the user in.
+	enum Prompt {
+		// Nothing: fails with InteractionRequired when it would have to ask.
+		None = "none",
+		// The sign-in page, even with a session.
+		Login = "login",
+		// The consent screen for the scopes asked.
+		Consent = "consent",
+		// The account picker.
+		SelectAccount = "select_account",
+	}
+
+	// SignInOptions adjust one sign-in.
+	struct SignInOptions {
+		prompt     ?Prompt
+		// The account to preselect, as its user principal name or email.
+		loginHint  ?string
+		// "consumers" or "organizations", or the user's domain, to skip
+		// the account-type page or go straight to a federated sign-in.
+		domainHint ?string
+	}
+
+	// Provider signs users in with one app registration of Microsoft Entra
+	// ID. Safe to use from several tasks.
+	type Provider {
+		clientId       string
+		clientSecret   ?Secret<string>
+		// A certificate credential instead of a secret: the chain and its
+		// private key (`tls.parseKeyPair(certPEM, keyPEM)`). Its SHA-256
+		// thumbprint names it in each signed assertion.
+		certificate    ?KeyPair
+		// Where Microsoft sends the browser back to; registered with the app.
+		redirectURL    string
+		// Who may sign in: "common" (any work, school or personal account),
+		// "organizations" (work and school), "consumers" (personal), or one
+		// tenant's id or domain.
+		tenant         string               = "common"
+		// The tenants whose users are accepted, by id; empty accepts every
+		// user the tenant setting lets in.
+		allowedTenants string[]             = []
+		// The cloud: login.microsoftonline.com, or a national cloud such as
+		// "https://login.microsoftonline.us".
+		authority      string               = globalAuthority
+		// Microsoft Graph of the same cloud.
+		graph          string
+		httpClient     ?http.Client
+		internal party ?openid.RelyingParty
+
+		def new(clientId string, clientSecret ?Secret<string> = none, certificate ?KeyPair = none, redirectURL string = "", tenant string = "common", allowedTenants string[] = [], authority string = globalAuthority, httpClient ?http.Client = none) {
+			self.clientId = clientId
+			self.clientSecret = clientSecret
+			self.certificate = certificate
+			self.redirectURL = redirectURL
+			self.tenant = tenant
+			self.allowedTenants = allowedTenants
+			self.authority = authority.trimSuffix("/")
+			self.httpClient = httpClient
+			graph = graphOf(self.authority)
+		}
+
+		// start begins a sign-in for the profile, a refresh token and
+		// Graph's /me, plus scopes (such as "Calendars.Read"). Fails when
+		// the tenant's discovery document cannot be read.
+		def start(scopes string[] = []) !oauth2.AuthorizationRequest {
+			return try start(scopes, SignInOptions{})
+		}
+
+		// start begins a sign-in with options. Fails as above.
+		def start(scopes string[], options SignInOptions) !oauth2.AuthorizationRequest {
+			let auth = oauth2.AuthorizationOptions{}
+			let prompt = options.prompt
+			auth.prompt = prompt.value unless prompt is none
+			let hint = options.loginHint
+			auth.extra.set("login_hint", hint) unless hint is none
+			let domain = options.domainHint
+			auth.extra.set("domain_hint", domain) unless domain is none
+			return try (try relyingParty()).authorize(redirectURL, withSignInScopes(scopes), auth)
+		}
+
+		// exchange finishes a sign-in from the callback URL. The profile
+		// comes from the ID token: `email` when the account has one, else
+		// the user principal name when it reads as an address. Fails with
+		// the error Microsoft put in the callback, StateMismatch,
+		// InvalidToken for an ID token that does not check out (another
+		// tenant's issuer included), and AccessDenied for a tenant outside
+		// allowedTenants.
+		def exchange(request oauth2.AuthorizationRequest, callback string) !Login {
+			let login = try (try relyingParty()).exchange(request, callback)
+			try checkTenant(login.claims)
+			fillProfile(login)
+			return login
+		}
+
+		// refresh renews the tokens of a sign-in. Fails with InvalidGrant
+		// when the refresh token expired or was revoked, and as the token
+		// request does.
+		def refresh(login Login) !Login {
+			let fresh = try (try relyingParty()).refresh(login)
+			fresh.profile = login.profile when fresh.idToken == login.idToken
+			fillProfile(fresh)
+			return fresh
+		}
+
+		// verifyIdToken checks an ID token the program did not get through
+		// exchange, such as one MSAL obtained in a browser or app: signed by
+		// Microsoft, unexpired, for this client, from its tenant's issuer,
+		// and of a tenant in allowedTenants when that is set. Fails with
+		// InvalidToken, and AccessDenied for a tenant not allowed.
+		def verifyIdToken(idToken string, nonce ?string = none) !IdClaims {
+			let claims = try (try relyingParty()).validateIdToken(idToken, nonce)
+			try checkTenant(claims)
+			return claims
+		}
+
+		// me reads the user's profile from Microsoft Graph's /me: display
+		// name, mail, preferred language. Needs a sign-in whose access
+		// token is for Graph (the default scopes). Fails with InvalidToken
+		// for an expired token, and as Graph does.
+		def me(login Login) !Profile {
+			let user = try graphObject(login.token, "/me")
+			let p = new Profile(login.profile.id)
+			p.name = textAt(user, "displayName")
+			let mail = textAt(user, "mail")
+			p.email = mail is none ?? (login.profile.email, mail)
+			p.emailVerified = login.profile.emailVerified
+			p.locale = textAt(user, "preferredLanguage")
+			p.picture = login.profile.picture
+			p.raw = user
+			return p
+		}
+
+		// photo reads the user's photo from Microsoft Graph; none when the
+		// user has none. Fails as Graph does.
+		def photo(login Login) !?byte[] {
+			let res = try graphGet(login.token, "/me/photo/$value")
+			return none when res.status == 404
+			fail graphError(res.status, try res.text()) unless res.status == 200
+			return try res.bytes()
+		}
+
+		// tokenFor gets an access token for another API with a sign-in's
+		// refresh token: scopes of one resource, such as
+		// "https://storage.azure.com/user_impersonation". The result's
+		// refresh token replaces the sign-in's. Fails with
+		// InteractionRequired when the user must consent first, and as the
+		// token request does.
+		def tokenFor(login Login, scopes string[]) !oauth2.Token {
+			return try (try relyingParty()).client.refresh(login.token, scopes)
+		}
+
+		// onBehalfOf trades the access token an API received for one to call
+		// another API as the same user (the on-behalf-of flow). Fails with
+		// InvalidGrant for a token not issued to this app, and as the token
+		// request does.
+		def onBehalfOf(accessToken Secret<string>, scopes string[]) !oauth2.Token {
+			let params = new map<string, string>()
+			params.set("assertion", accessToken.reveal())
+			params.set("requested_token_use", "on_behalf_of")
+			params.set("scope", scopes.join(" "))
+			return try (try relyingParty()).client.grant("urn:ietf:params:oauth:grant-type:jwt-bearer", params)
+		}
+
+		// appToken gets a token for the app itself, with the permissions an
+		// administrator granted it (client credentials); scopes name one
+		// resource's ".default", such as "https://graph.microsoft.com/.default".
+		// Needs a tenant id or domain, not "common". Fails as the token
+		// request does.
+		def appToken(scopes string[]) !oauth2.Token {
+			return try (try relyingParty()).client.clientCredentials(scopes)
+		}
+
+		// relyingParty reads the tenant's discovery document once. For the
+		// multi-tenant endpoints its issuer is a template naming
+		// `{tenantid}`, which oauth2.discover would refuse.
+		internal def relyingParty() !openid.RelyingParty {
+			let known = cached()
+			return known unless known is none
+			let target = authority + "/" + tenant + "/v2.0/.well-known/openid-configuration"
+			let res = client().get(target) onerror (err error) {
+				fail oauth2.OAuthError{message: "microsoft: cannot reach {target}: {err.message}", code: oauth2.OAuthErrorKind.Transport.value, cause: err, kind: oauth2.OAuthErrorKind.Transport}
+			}
+			let text = try res.text()
+			fail oauth2.OAuthError{message: "microsoft: {target} answered {res.status}", code: oauth2.OAuthErrorKind.Transport.value, kind: oauth2.OAuthErrorKind.Transport, status: res.status} unless res.status == 200
+			let provider = new openid.ProviderMetadata(try oauth2.parseMetadata(text))
+			let rp = new openid.RelyingParty(clientId, provider)
+			rp.client.httpClient = httpClient
+			rp.client.secret = clientSecret
+			let cert = certificate
+			if !(cert is none) {
+				rp.client.key = try certificateKey(cert)
+				rp.client.authentication = oauth2.ClientAuthentication.PrivateKeyJwt
+			}
+			let jwks = provider.oauth.jwksUri
+			rp.keys = new jose.RemoteKeySet(jwks, httpClient) unless jwks is none
+			let template = provider.oauth.issuer
+			rp.acceptIssuer = def (issuer string, claims map<string, any>) bool {
+				return issuer == template unless template.contains("\{tenantid}")
+				let tid = claims.get("tid")
+				return !(tid is none) && issuer == template.replace("\{tenantid}", "{tid}")
+			}
+			return keep(rp)
+		}
+
+		internal def client() http.Client {
+			let given = httpClient
+			return given is none ?? (new http.Client(), given)
+		}
+
+		internal atomic def cached() ?openid.RelyingParty {
+			return party
+		}
+
+		internal atomic def keep(rp openid.RelyingParty) openid.RelyingParty {
+			let earlier = party
+			return earlier unless earlier is none
+			party = rp
+			return rp
+		}
+
+		internal def checkTenant(claims IdClaims) !none {
+			return none when allowedTenants.len() == 0
+			let tid = claims.get("tid")
+			fail oauth2.OAuthError{message: "microsoft: the account's tenant is not allowed", code: oauth2.OAuthErrorKind.AccessDenied.value, kind: oauth2.OAuthErrorKind.AccessDenied, description: "the account's tenant is not allowed"} unless !(tid is none) && "{tid}" in allowedTenants
+			return none
+		}
+
+		internal def graphGet(token oauth2.Token, path string) !Response {
+			let req = try newRequest(Method.GET, graph + path)
+			return (try relyingParty()).client.send(req, token) onerror (err error) {
+				fail oauth2.OAuthError{message: "microsoft: cannot reach Graph: {err.message}", code: oauth2.OAuthErrorKind.Transport.value, cause: err, kind: oauth2.OAuthErrorKind.Transport}
+			}
+		}
+
+		internal def graphObject(token oauth2.Token, path string) !map<string, any> {
+			let res = try graphGet(token, path)
+			let text = try res.text()
+			fail graphError(res.status, text) unless res.status == 200
+			let parsed = new JSON().parse(text) onerror fail graphError(200, "Graph did not answer JSON")
+			let m = new map<string, any>()
+			m = parsed when parsed is map<string, any>
+			return m
+		}
+	}
+
+	// fillProfile completes the profile of a sign-in from Microsoft's own
+	// claims: the address is the UPN when there is no `email`, and
+	// `xms_edov` says whether the email's domain is verified.
+	internal def fillProfile(login Login) {
+		let p = login.profile
+		if p.email is none {
+			let upn = login.claims.preferredUsername
+			p.email = upn when !(upn is none) && upn.contains("@")
+		}
+		let verified = login.claims.get("xms_edov")
+		p.emailVerified = p.emailVerified || (verified is bool && verified) || (verified is string && verified == "true")
+		// A personal account's email is the account itself.
+		let tid = login.claims.get("tid")
+		p.emailVerified = true when !(tid is none) && "{tid}" == consumersTenantId && !(p.email is none)
+	}
+
+	// certificateKey is a certificate credential as the signing key of
+	// client assertions, its thumbprints in the key.
+	internal def certificateKey(pair KeyPair) !jose.Jwk {
+		let privateKey = pair.privateKey
+		fail oauth2.OAuthError{message: "microsoft: the certificate has no private key", code: oauth2.OAuthErrorKind.Malformed.value, kind: oauth2.OAuthErrorKind.Malformed} when privateKey is none || pair.chain.len() == 0
+		let key = new jose.Jwk(privateKey)
+		key.x5c = pair.chain
+		key.x5tS256 = digest(Hash.SHA256, pair.chain[0])
+		key.x5t = digest(Hash.SHA1, pair.chain[0])
+		return key
+	}
+
+	// graphOf is the Microsoft Graph of a cloud's sign-in address.
+	internal def graphOf(authority string) string {
+		return "https://graph.microsoft.us/v1.0" when authority.endsWith(".us")
+		return "https://microsoftgraph.chinacloudapi.cn/v1.0" when authority.endsWith(".cn")
+		return "https://graph.microsoft.com/v1.0"
+	}
+
+	internal def withSignInScopes(scopes string[]) string[] {
+		let all string[] = []
+		for let s in signInScopes {
+			all.push(s)
+		}
+		for let s in scopes {
+			all.push(s) unless s in all
+		}
+		return all
+	}
+
+	internal def textAt(m map<string, any>, name string) ?string {
+		let v = m.get(name)
+		return v is string ?? (v, none)
+	}
+
+	// graphError is a failed Graph call, with Graph's error message.
+	internal def graphError(status int, body string) error {
+		let message = body
+		let parsed = new JSON().parse(body) onerror recover none
+		if parsed is map<string, any> {
+			let inner = parsed.get("error")
+			if inner is map<string, any> {
+				let m = textAt(inner, "message")
+				message = m unless m is none
+			}
+		}
+		let kind = oauth2.OAuthErrorKind.ServerError
+		kind = oauth2.OAuthErrorKind.InvalidToken when status == 401
+		kind = oauth2.OAuthErrorKind.AccessDenied when status == 403
+		kind = oauth2.OAuthErrorKind.Malformed when status == 200
+		return oauth2.OAuthError{message: "microsoft: Graph: {message}", code: kind.value, kind: kind, description: message, status: status}
+	}
 }

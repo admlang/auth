@@ -1,5 +1,5 @@
 // Sign in with Google
-@manifest(version = "0.0.1")
+@manifest(version = "0.1.0")
 library adm.auth.google {
 	use (
 		adm.auth.google

@@ -1,0 +1,277 @@
+partial module adm.auth.apple {
+	use (
+		std.time
+		std.testing
+		std.net.http
+		std.net.http::(Context, ServeMux, Request)
+		std.net.http.httptest
+		std.net.url::(parseQuery, queryEscape)
+		std.crypto::(PrivateKey, generateECDSAKey, marshalPKCS8PrivateKey, publicKeyOf, p256)
+		std.data.encoding::(JSON, PEMBlock, pemEncode)
+		std.proto.auth.jose
+		std.proto.auth.oauth2
+		std.proto.auth.openid
+	)
+
+	// A real ID token and the client (bundle id or Services ID) it was
+	// issued to.
+	@env("ADM_TEST_APPLE_ID_TOKEN")
+	internal const liveIdToken string
+
+	@env("ADM_TEST_APPLE_CLIENT_ID")
+	internal const liveClientId string
+
+	internal type StopRedirects {
+		def new() {}
+
+		def follow(next Request, via Request[]) !bool {
+			return false
+		}
+	}
+
+	// A loopback Apple: it posts sign-ins back as forms, takes the client
+	// secret JWT signed with the team's key, and signs notifications.
+	internal type FakeApple {
+		site    httptest.Server
+		op      openid.Provider
+		signing jose.Jwk
+		// The team's key and its .p8 text.
+		teamKey PrivateKey
+		p8      string
+		browser http.Client
+		client  oauth2.RegisteredClient
+		// The client secrets the token and revocation endpoints received.
+		secrets string[]                = []
+
+		def new(site httptest.Server, op openid.Provider, signing jose.Jwk, teamKey PrivateKey, client oauth2.RegisteredClient) {
+			self.client = client
+			self.site = site
+			self.op = op
+			self.signing = signing
+			self.teamKey = teamKey
+			p8 = pemEncode(new PEMBlock("PRIVATE KEY", marshalPKCS8PrivateKey(teamKey)))
+			browser = site.client()
+			browser.redirects = new StopRedirects()
+		}
+
+		// signIn follows the authorization URL through the login page and
+		// returns the form body Apple would post, with the `user` field of
+		// a first sign-in when user is not empty.
+		def signIn(authorizationURL string, user string = "") !string {
+			let first = try browser.get(authorizationURL)
+			assert first.status == 303
+			let page = try browser.get(first.header("Location"))
+			assert page.status == 200
+			let html = try page.text()
+			let fields string[] = []
+			for let part in html.split("<input type=\"hidden\" name=\"")[1:] {
+				let name = part.split("\"")[0]
+				let value = part.split("value=\"")[1].split("\"")[0]
+				fields.push(name + "=" + queryEscape(value))
+			}
+			fields.push("user=" + queryEscape(user)) unless user == ""
+			return fields.join("&")
+		}
+
+		def mint(claims map<string, any>) !string {
+			let c = new jose.Claims()
+			c.issuer = site.url
+			c.issuedAt = time.now()
+			c.expires = time.now() + 1h
+			for let (name, value) in claims {
+				try c.set(name, value)
+			}
+			return try c.sign(signing)
+		}
+
+		def provider() Provider {
+			return new Provider("com.example.web", "TEAM123456", "KEY1234567", p8, redirectURL = site.url + "/cb", bundleIds = ["com.example.app"], issuer = site.url, httpClient = site.client())
+		}
+	}
+
+	internal def fakeApple() !FakeApple {
+		let signing = try jose.generateKey(jose.SignatureAlgorithm.RS256)
+		signing.kid = "apple-1"
+		let server = new oauth2.AuthorizationServer("http://placeholder", new jose.JwkSet([signing]))
+		let users = new openid.MemoryUserStore()
+		users.add("001234.abcd", map<string, any>{"email": "x7q2@privaterelay.appleid.com", "email_verified": "true"})
+		let op = new openid.Provider(server, users)
+		op.scopeClaimsInIdToken = true
+		server.scopesSupported = ["openid", "name", "email"]
+		let teamKey PrivateKey = try generateECDSAKey(p256)
+		let holder ?FakeApple = none
+		let mux = new ServeMux()
+		try mux.handle("/login", def (ctx Context) !none {
+			let claims map<string, any>
+			claims.set("is_private_email", "true")
+			return try server.complete(ctx, ctx.query("request", ""), oauth2.Decision{subject: "001234.abcd", claims: claims})
+		})
+		// As Apple's: no `iss` advertised for authorization responses.
+		let discovery = def (ctx Context) !none {
+			let m = server.metadata()
+			m.authorizationResponseIssParameterSupported = false
+			return try ctx.blob(200, "application/json", m.json().bytes())
+		}
+		try mux.handle("GET /.well-known/openid-configuration", discovery)
+		try mux.handle("GET /.well-known/oauth-authorization-server", discovery)
+		// The token and revocation endpoints check the client secret JWT,
+		// then serve the client as the public one it is registered as.
+		let checked = def (ctx Context) !none {
+			let a = holder
+			fail "no fake" when a is none
+			let form = try parseQuery(try ctx.text())
+			let secret = form.get("client_secret")
+			return try ctx.text(401, "\{\"error\":\"invalid_client\"}") when secret is none
+			let v = jose.Validation{algorithms: [jose.SignatureAlgorithm.ES256], issuer: "TEAM123456", audience: a.site.url, subject: "com.example.web"}
+			let team = new jose.Jwk(publicKeyOf(a.teamKey))
+			team.kid = "KEY1234567"
+			let ok = jose.verifyJwt(secret, team, v) is jose.Claims
+			let kid = (try jose.parseJws(secret)).signatures[0].protected.kid
+			return try ctx.text(401, "\{\"error\":\"invalid_client\"}") unless ok && !(kid is none) && kid == "KEY1234567"
+			a.secrets.push(secret)
+			// The verified JWT is the client's secret for this request.
+			a.client.secret = secret
+			try a.op.server.clients.save(a.client)
+			return try a.op.handler().serve(ctx)
+		}
+		try mux.handle("POST /token", checked)
+		try mux.handle("POST /revoke", checked)
+		try mux.handle("/", op.handler())
+		let site = new httptest.Server(mux)
+		try site.start()
+		server.issuer = site.url
+		server.loginURL = site.url + "/login"
+		let m = new oauth2.ClientMetadata()
+		m.redirectUris = [site.url + "/cb"]
+		m.grantTypes = ["authorization_code", "refresh_token"]
+		m.tokenEndpointAuthMethod = "client_secret_post"
+		let client = new oauth2.RegisteredClient("com.example.web", m)
+		client.secret = "unset"
+		try server.clients.save(client)
+		let a = new FakeApple(site, op, signing, teamKey, client)
+		holder = a
+		return a
+	}
+
+	check "Sign in with Apple" {
+		@test()
+		def TestSignIn() !none {
+			let a = try fakeApple()
+			let apple = a.provider()
+			let start = try apple.start()
+			assert start.url.contains("response_mode=form_post") && start.url.contains("scope=openid+name+email")
+			let form = try a.signIn(start.url, "\{\"name\":\{\"firstName\":\"Ada\",\"lastName\":\"Lovelace\"},\"email\":\"x7q2@privaterelay.appleid.com\"}")
+			let login = try apple.exchange(start, form)
+			// The provider serves a handler written for any provider.
+			let generic openid.SignInProvider = apple
+			assert (try generic.start()).url.contains("code_challenge=")
+			let p = login.profile
+			assert p.id == "001234.abcd" && orEmpty(p.name) == "Ada Lovelace"
+			assert orEmpty(p.email) == "x7q2@privaterelay.appleid.com" && p.emailVerified
+			assert flagOf(login.claims.get("is_private_email"))
+			assert a.secrets.len() == 1
+			// The name comes once; a later sign-in has none.
+			let again = try apple.start()
+			let later = try apple.exchange(again, try a.signIn(again.url))
+			assert later.profile.name is none
+			// The client secret is reused until it is due.
+			assert a.secrets.len() == 2 && a.secrets[0] == a.secrets[1]
+			// Refresh keeps the stored name; revocation ends the sign-in.
+			let fresh = try apple.refresh(login)
+			assert orEmpty(fresh.profile.name) == "Ada Lovelace" && fresh.profile.emailVerified
+			try apple.revoke(fresh)
+			assert apple.refresh(fresh) is error
+		}
+
+		@test()
+		def TestCancelled() !none {
+			let a = try fakeApple()
+			let apple = a.provider()
+			let start = try apple.start()
+			assert exchangeFailure(apple, start, "error=user_cancelled_authorize&state=" + start.state) == oauth2.OAuthErrorKind.Other.value
+			assert exchangeFailure(apple, start, "code=forged&state=wrong") == oauth2.OAuthErrorKind.StateMismatch.value
+			// A key that is not the team's .p8 text.
+			let broken = new Provider("com.example.web", "TEAM123456", "KEY1234567", "not a key", issuer = a.site.url, httpClient = a.site.client())
+			assert broken.start() is error
+		}
+
+		@test()
+		def TestNativeIdToken() !none {
+			let a = try fakeApple()
+			let apple = a.provider()
+			let native = try a.mint(map<string, any>{"aud": "com.example.app", "sub": "001234.abcd", "nonce": "n-1", "real_user_status": 2, "email_verified": true})
+			let claims = try apple.verifyIdToken(native, audience = "com.example.app", nonce = "n-1")
+			assert claims.subject == "001234.abcd" && apple.realUser(claims) == RealUser.LikelyReal
+			assert apple.verifyIdToken(native, audience = "com.example.app", nonce = "n-2") is error
+			assert apple.verifyIdToken(native) is error
+			assert apple.verifyIdToken(native, audience = "com.other.app") is error
+			let web = try a.mint(map<string, any>{"aud": "com.example.web", "sub": "001234.abcd"})
+			assert apple.realUser(try apple.verifyIdToken(web)) == RealUser.Unsupported
+		}
+
+		@test()
+		def TestNotifications() !none {
+			let a = try fakeApple()
+			let apple = a.provider()
+			let seen Notification[] = []
+			let mux = new ServeMux()
+			try mux.handle("POST /apple/events", apple.notifications(def (n Notification) !none {
+				seen.push(n)
+				return none
+			}))
+			let site = new httptest.Server(mux)
+			try site.start()
+			let events = string(new JSON().encode(map<string, any>{"type": "email-disabled", "sub": "001234.abcd", "email": "x7q2@privaterelay.appleid.com", "is_private_email": "true", "event_time": 1700000000000}))
+			let payload = try a.mint(map<string, any>{"aud": "com.example.app", "jti": "j-1", "events": events})
+			let res = try site.client().post(site.url + "/apple/events", "application/json", "\{\"payload\":\"{payload}\"}".bytes())
+			assert res.status == 200 && seen.len() == 1
+			let n = seen[0]
+			assert n.kind == NotificationKind.EmailDisabled && n.subject == "001234.abcd" && n.isPrivateEmail
+			assert orEmpty(n.email) == "x7q2@privaterelay.appleid.com" && n.time.unixNs() == int64(1700000000) * 1000000000
+			// The body read without the handler.
+			let direct = try apple.notification("\{\"payload\":\"{payload}\"}")
+			assert direct.kind == NotificationKind.EmailDisabled && direct.subject == "001234.abcd"
+			assert apple.notification("\{\"payload\":\"x.y.z\"}") is error
+			// Another key, another audience, no payload.
+			let forger = try jose.generateKey(jose.SignatureAlgorithm.RS256)
+			forger.kid = "apple-1"
+			let c = new jose.Claims()
+			c.issuer = a.site.url
+			c.audience = ["com.example.app"]
+			c.issuedAt = time.now()
+			c.expires = time.now() + 1h
+			try c.set("events", events)
+			for let body in ["\{\"payload\":\"{try c.sign(forger)}\"}", "\{\"payload\":\"{try a.mint(map<string, any>{"aud": "com.other.app", "events": "{}"})}\"}", "\{}"] {
+				let refused = try site.client().post(site.url + "/apple/events", "application/json", body.bytes())
+				assert refused.status == 400
+			}
+			assert seen.len() == 1
+		}
+
+		@test()
+		def TestLiveIdToken() !none {
+			return none when liveIdToken == "" || liveClientId == ""
+			let key = try generateECDSAKey(p256)
+			let p8 = pemEncode(new PEMBlock("PRIVATE KEY", marshalPKCS8PrivateKey(key)))
+			let apple = new Provider(liveClientId, "TEAM", "KEY", p8)
+			assert (try apple.verifyIdToken(liveIdToken)).subject != ""
+		}
+	}
+
+	internal def failureKind(err error) oauth2.OAuthErrorKind {
+		return err is oauth2.OAuthError ?? (err.kind, oauth2.OAuthErrorKind.Other)
+	}
+
+	// exchangeFailure is the error code exchange fails with ("ok" when it
+	// does not fail; "other" for an error that is not an OAuth error).
+	internal def exchangeFailure(apple Provider, start oauth2.AuthorizationRequest, callback string) string {
+		apple.exchange(start, callback) onerror (err error) {
+			return failureKind(err).value
+		}
+		return "ok"
+	}
+
+	internal def orEmpty(text ?string) string {
+		return text is none ?? ("", text)
+	}
+}

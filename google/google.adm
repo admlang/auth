@@ -1,3 +1,262 @@
+// Sign in with Google over std.proto.auth.openid: discovery, the
+// authorization code flow with PKCE, ID tokens from One Tap, the Sign in
+// with Google button and mobile apps, refresh, revocation, token info, and
+// Google Workspace domain checks.
+//
+// ```
+// let google = new google.Provider(clientId, clientSecret, redirectURL = "https://example.com/auth/google")
+// let request = try google.start()
+// // send the browser to request.url, keep request with the session; at the callback:
+// let login = try google.exchange(request, callbackURL)
+// print("{login.profile.name} <{login.profile.email}>")
+// ```
 partial module adm.auth.google {
-	// Sign in with Google over std.proto.auth.openid: discovery, the authorization code flow with PKCE, ID token verification (also for One Tap and mobile tokens), refresh, hosted domain checks, a Profile from the claims
+	use (
+		std.time
+		std.net.http
+		std.net.url
+		std.data.encoding::(JSON)
+		std.proto.auth.oauth2
+		std.proto.auth.openid
+		std.proto.auth.openid::(Login, IdClaims, Profile)
+	)
+
+	// Google's issuer.
+	const googleIssuer = "https://accounts.google.com"
+
+	// Where Google answers questions about an access token.
+	const tokenInfoURL = "https://oauth2.googleapis.com/tokeninfo"
+
+	// The scopes every sign-in asks for besides `openid`.
+	const signInScopes = ["email", "profile"]
+
+	// What Google shows before it signs the user in.
+	enum Prompt {
+		// Nothing: fails with LoginRequired or ConsentRequired when Google
+		// would have to ask.
+		None = "none",
+		// The consent screen, even for scopes granted before; also how an
+		// offline provider gets a new refresh token.
+		Consent = "consent",
+		// The account chooser.
+		SelectAccount = "select_account",
+	}
+
+	// SignInOptions adjust one sign-in.
+	struct SignInOptions {
+		// What to show; several combine (Consent and SelectAccount).
+		prompt               Prompt[] = []
+		// The email or `sub` of the account to preselect.
+		loginHint            ?string
+		// Keep the scopes the user granted before, so a later sign-in asks
+		// only for the new ones (incremental authorization).
+		includeGrantedScopes bool     = false
+	}
+
+	// TokenInfo is what Google knows of an access token.
+	struct TokenInfo {
+		// The client the token was issued to.
+		audience string
+		scopes   string[]
+		expires  time.Time
+		// The user's id, when the token carries the openid scope.
+		subject  ?string
+		email    ?string
+	}
+
+	// Provider signs users in with Google for one OAuth client of a Google
+	// Cloud project. Safe to use from several tasks.
+	type Provider {
+		clientId       string
+		clientSecret   ?Secret<string>
+		// Where Google sends the browser back to; registered with the client.
+		redirectURL    string
+		// The Google Workspace domain users must belong to (the `hd`
+		// claim). None accepts any account, including personal ones.
+		hostedDomain   ?string
+		// Ask for a refresh token (`access_type=offline`). Google issues one
+		// on the first consent only; Prompt.Consent asks again.
+		offline        bool                 = false
+		// The client ids of the project's Android and iOS apps, whose ID
+		// tokens verifyIdToken accepts and which may appear as `azp`.
+		appClientIds   string[]             = []
+		// Google's issuer; another value is for tests.
+		issuer         string               = googleIssuer
+		httpClient     ?http.Client
+		internal party ?openid.RelyingParty
+
+		def new(clientId string, clientSecret ?Secret<string> = none, redirectURL string = "", hostedDomain ?string = none, offline bool = false, issuer string = googleIssuer, httpClient ?http.Client = none) {
+			self.clientId = clientId
+			self.clientSecret = clientSecret
+			self.redirectURL = redirectURL
+			self.hostedDomain = hostedDomain
+			self.offline = offline
+			self.issuer = issuer
+			self.httpClient = httpClient
+		}
+
+		// start begins a sign-in for the email and profile scopes plus
+		// scopes (such as "https://www.googleapis.com/auth/calendar.readonly").
+		// Fails when Google's discovery document cannot be read.
+		def start(scopes string[] = []) !oauth2.AuthorizationRequest {
+			return try start(scopes, SignInOptions{})
+		}
+
+		// start begins a sign-in with options. Fails as above.
+		def start(scopes string[], options SignInOptions) !oauth2.AuthorizationRequest {
+			let rp = try relyingParty()
+			let auth = oauth2.AuthorizationOptions{}
+			let prompts string[] = []
+			for let p in options.prompt {
+				prompts.push(p.value)
+			}
+			auth.prompt = prompts.join(" ") when prompts.len() > 0
+			let hint = options.loginHint
+			auth.extra.set("login_hint", hint) unless hint is none
+			let domain = hostedDomain
+			auth.extra.set("hd", domain) unless domain is none
+			auth.extra.set("access_type", "offline") when offline
+			auth.extra.set("include_granted_scopes", "true") when options.includeGrantedScopes
+			return try rp.authorize(redirectURL, withSignInScopes(scopes), auth)
+		}
+
+		// exchange finishes a sign-in from the callback URL. Fails with
+		// the error Google put in the callback, StateMismatch, InvalidToken
+		// for an ID token that does not check out, and AccessDenied for an
+		// account outside hostedDomain.
+		def exchange(request oauth2.AuthorizationRequest, callback string) !Login {
+			let login = try (try relyingParty()).exchange(request, callback)
+			try checkDomain(login.claims)
+			return login
+		}
+
+		// refresh renews the tokens of an offline sign-in. Fails with
+		// Malformed without a refresh token, InvalidGrant when the user
+		// revoked access, and as the token request does.
+		def refresh(login Login) !Login {
+			return try (try relyingParty()).refresh(login)
+		}
+
+		// verifyIdToken checks an ID token the program did not get through
+		// exchange: from One Tap, the Sign in with Google button, or a
+		// mobile app. It must be signed by Google, unexpired, for audience
+		// (this client when none, else a client of appClientIds), and in
+		// hostedDomain when one is set. Fails with InvalidToken, and
+		// AccessDenied for an account outside hostedDomain.
+		def verifyIdToken(idToken string, audience ?string = none, nonce ?string = none) !IdClaims {
+			let rp = try relyingParty()
+			let checker = rp
+			if !(audience is none) && audience != clientId {
+				fail refused("{audience} is neither this client nor one of appClientIds") unless audience in appClientIds
+				checker = new openid.RelyingParty(audience, rp.provider)
+				checker.keys = rp.keys
+				checker.acceptIssuer = rp.acceptIssuer
+				checker.authorizedParties = withClient(appClientIds)
+			}
+			let claims = try checker.validateIdToken(idToken, nonce)
+			try checkDomain(claims)
+			return claims
+		}
+
+		// userInfo reads the profile from Google's UserInfo endpoint, which
+		// is current where the ID token's claims date from the sign-in.
+		// Fails as openid.RelyingParty.userInfo does.
+		def userInfo(login Login) !Profile {
+			return new Profile(try (try relyingParty()).userInfo(login))
+		}
+
+		// tokenInfo asks Google about an access token. Fails with
+		// InvalidToken for a token Google does not know or that expired.
+		def tokenInfo(token Secret<string>) !TokenInfo {
+			let target = issuer == googleIssuer ?? (tokenInfoURL, issuer.trimSuffix("/") + "/tokeninfo")
+			let res = client().get(target + "?access_token=" + url.queryEscape(token.reveal())) onerror (err error) {
+				fail oauth2.OAuthError{message: "google: cannot reach {target}: {err.message}", code: oauth2.OAuthErrorKind.Transport.value, cause: err, kind: oauth2.OAuthErrorKind.Transport}
+			}
+			let text = try res.text()
+			fail oauth2.OAuthError{message: "google: the token is not valid", code: oauth2.OAuthErrorKind.InvalidToken.value, kind: oauth2.OAuthErrorKind.InvalidToken, status: res.status} unless res.status == 200
+			return try tokenInfoOf(text)
+		}
+
+		// revoke ends the access a sign-in granted: its refresh token when
+		// it has one, else its access token. Fails as the revocation
+		// request does.
+		def revoke(login Login) !none {
+			return try (try relyingParty()).client.revoke(login.token)
+		}
+
+		// relyingParty discovers Google once and keeps the result.
+		internal def relyingParty() !openid.RelyingParty {
+			let known = cached()
+			return known unless known is none
+			let rp = try openid.connect(issuer, clientId, clientSecret, client())
+			let expected = issuer
+			rp.acceptIssuer = def (iss string, claims map<string, any>) bool {
+				// Google's ID tokens name the issuer with or without its scheme.
+				return iss == expected || expected.endsWith("://" + iss)
+			}
+			rp.authorizedParties = appClientIds
+			return keep(rp)
+		}
+
+		internal def client() http.Client {
+			let given = httpClient
+			return given is none ?? (new http.Client(), given)
+		}
+
+		internal atomic def cached() ?openid.RelyingParty {
+			return party
+		}
+
+		internal atomic def keep(rp openid.RelyingParty) openid.RelyingParty {
+			let earlier = party
+			return earlier unless earlier is none
+			party = rp
+			return rp
+		}
+
+		internal def checkDomain(claims IdClaims) !none {
+			let domain = hostedDomain
+			return none when domain is none
+			let hd = claims.get("hd")
+			fail refused("the account is not in {domain}") unless !(hd is none) && "{hd}" == domain
+			return none
+		}
+
+		internal def withClient(ids string[]) string[] {
+			let out = [clientId]
+			for let id in ids {
+				out.push(id)
+			}
+			return out
+		}
+	}
+
+	internal def withSignInScopes(scopes string[]) string[] {
+		let all string[] = []
+		for let s in signInScopes {
+			all.push(s)
+		}
+		for let s in scopes {
+			all.push(s) unless s in all
+		}
+		return all
+	}
+
+	// tokenInfoOf reads Google's token info, whose numbers are strings.
+	internal def tokenInfoOf(text string) !TokenInfo {
+		let parsed = try new JSON().parse(text)
+		let m = new map<string, any>()
+		m = parsed when parsed is map<string, any>
+		fail oauth2.OAuthError{message: "google: token info is not a JSON object", code: oauth2.OAuthErrorKind.Malformed.value, kind: oauth2.OAuthErrorKind.Malformed} unless m.hasKey("aud")
+		let member = (name string) => m.hasKey(name) ?? ("{m[name]}", "")
+		let scope = member("scope")
+		let info = TokenInfo{audience: member("aud"), scopes: scope == "" ?? ([], scope.split(" ")), expires: time.fromUnixNs(int64(parseInt<int>(member("exp"))) * 1000000000)}
+		info.subject = member("sub") when m.hasKey("sub")
+		info.email = member("email") when m.hasKey("email")
+		return info
+	}
+
+	internal def refused(text string) error {
+		return oauth2.OAuthError{message: "google: " + text, code: oauth2.OAuthErrorKind.AccessDenied.value, kind: oauth2.OAuthErrorKind.AccessDenied, description: text}
+	}
 }

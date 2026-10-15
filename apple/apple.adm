@@ -1,3 +1,363 @@
+// Sign in with Apple over std.proto.auth.openid: the client secret Apple
+// wants as an ES256 JWT, signed with the team's key and renewed before it
+// expires, the web flow with its form_post callback, the user's name that
+// arrives on the first sign-in only, ID tokens of native apps, private
+// relay addresses, refresh and revocation, and Apple's server-to-server
+// notifications.
+//
+// ```
+// let apple = new apple.Provider(servicesId, teamId, keyId, privateKey, redirectURL = "https://example.com/auth/apple")
+// let request = try apple.start()
+// // send the browser to request.url, keep request with the session; Apple posts
+// // the result to redirectURL as a form:
+// let login = try apple.exchange(request, try ctx.text())
+// print(login.profile.name)    // the first sign-in only: store it
+// ```
 partial module adm.auth.apple {
-	// Sign in with Apple over std.proto.auth.openid: the client secret as an ES256 JWT signed with the team key and renewed before it expires, authorization code and ID token flows for web and native apps, the name given only on first sign-in, private relay addresses, server-to-server notifications
+	use (
+		std.time
+		std.net.http
+		std.net.http::(Context)
+		std.crypto::(parsePKCS8PrivateKey)
+		std.data.encoding::(JSON, pemDecode)
+		std.net.url::(parseQuery)
+		std.proto.auth.jose
+		std.proto.auth.oauth2
+		std.proto.auth.openid
+		std.proto.auth.openid::(Login, IdClaims)
+	)
+
+	// Apple's issuer.
+	const appleIssuer = "https://appleid.apple.com"
+
+	// How long a client secret is valid; Apple accepts up to six months.
+	const secretLifetime = 24h
+
+	// How long before its expiry a client secret is replaced.
+	const secretRenewal = 1h
+
+	// The scopes a web sign-in asks for besides `openid`.
+	const signInScopes = ["name", "email"]
+
+	// Whether Apple thinks the user is a real person (`real_user_status`),
+	// for apps that fight fraud. Only native sign-ins on iOS report it.
+	enum RealUser {
+		Unsupported = 0,
+		Unknown     = 1,
+		LikelyReal  = 2,
+	}
+
+	// What a server-to-server notification reports.
+	enum NotificationKind {
+		// The user stopped forwarding mail from the private relay address.
+		EmailDisabled = "email-disabled",
+		// The user forwards mail from the private relay address again.
+		EmailEnabled = "email-enabled",
+		// The user stopped using Sign in with Apple for the app.
+		ConsentRevoked = "consent-revoked",
+		// The user deleted their Apple Account.
+		AccountDeleted = "account-delete",
+	}
+
+	// Notification is a verified server-to-server notification.
+	struct Notification {
+		kind           NotificationKind
+		// The user's id, as `Profile.id` has it.
+		subject        string
+		email          ?string
+		isPrivateEmail bool             = false
+		time           time.Time
+	}
+
+	// Provider signs users in with Apple for one Services ID (the web) and
+	// the team's apps. Safe to use from several tasks.
+	type Provider {
+		// The Services ID, the client id of the web flow.
+		servicesId       string
+		teamId           string
+		// The id of the Sign in with Apple key.
+		keyId            string
+		// Where Apple posts the result; registered with the Services ID.
+		redirectURL      string
+		// The bundle ids of the team's apps, whose ID tokens verifyIdToken
+		// accepts and whose notifications arrive here.
+		bundleIds        string[]             = []
+		// Apple's issuer; another value is for tests.
+		issuer           string               = appleIssuer
+		httpClient       ?http.Client
+		internal key     Secret<string>
+		internal party   ?openid.RelyingParty
+		internal renewAt time.Time
+
+		// new takes the private key as the text of the .p8 file Apple
+		// gave for keyId.
+		def new(servicesId string, teamId string, keyId string, privateKey Secret<string>, redirectURL string = "", bundleIds string[] = [], issuer string = appleIssuer, httpClient ?http.Client = none) {
+			self.servicesId = servicesId
+			self.teamId = teamId
+			self.keyId = keyId
+			key = privateKey
+			self.redirectURL = redirectURL
+			self.bundleIds = bundleIds
+			self.issuer = issuer
+			self.httpClient = httpClient
+			renewAt = time.now()
+		}
+
+		// start begins a web sign-in for the name and email plus scopes.
+		// Apple posts the result as a form, so the callback route takes
+		// POST. Fails when Apple's discovery document cannot be read or the
+		// private key does not parse.
+		def start(scopes string[] = []) !oauth2.AuthorizationRequest {
+			let auth = oauth2.AuthorizationOptions{responseMode: "form_post"}
+			return try (try relyingParty()).authorize(redirectURL, withSignInScopes(scopes), auth)
+		}
+
+		// exchange finishes a sign-in from the form Apple posted (the
+		// request body) or a callback URL. On the first sign-in the form
+		// carries the user's name, which goes into the profile; Apple never
+		// sends it again. Fails with the error Apple put in the form (such
+		// as AccessDenied when the user cancelled), StateMismatch,
+		// InvalidToken for an ID token that does not check out, and as the
+		// token request does.
+		def exchange(request oauth2.AuthorizationRequest, callback string) !Login {
+			let login = try (try relyingParty()).exchange(request, callback)
+			fillProfile(login)
+			login.profile.name = nameOf(callback)
+			return login
+		}
+
+		// refresh renews the tokens of a sign-in, which also proves the
+		// user still uses Sign in with Apple. Apple may throttle refreshes
+		// made more than once a day. Fails with InvalidGrant when the user
+		// revoked consent, and as the token request does.
+		def refresh(login Login) !Login {
+			let fresh = try (try relyingParty()).refresh(login)
+			let name = login.profile.name
+			fillProfile(fresh)
+			fresh.profile.name = name
+			return fresh
+		}
+
+		// verifyIdToken checks an ID token a native app got from Apple:
+		// signed by Apple, unexpired, for audience (a bundle id of
+		// bundleIds, or the Services ID when none), with the nonce the app
+		// sent when given. Fails with InvalidToken.
+		def verifyIdToken(idToken string, audience ?string = none, nonce ?string = none) !IdClaims {
+			let rp = try relyingParty()
+			let checker = rp
+			if !(audience is none) && audience != servicesId {
+				fail refused("{audience} is neither the Services ID nor one of bundleIds") unless audience in bundleIds
+				checker = new openid.RelyingParty(audience, rp.provider)
+				checker.keys = rp.keys
+			}
+			return try checker.validateIdToken(idToken, nonce)
+		}
+
+		// revoke ends a sign-in: Apple revokes its tokens and the user's
+		// consent, as account deletion in the app requires. Fails as the
+		// revocation request does.
+		def revoke(login Login) !none {
+			return try (try relyingParty()).client.revoke(login.token)
+		}
+
+		// notifications is the handler of the server-to-server notification
+		// endpoint registered with the app: it verifies Apple's signed
+		// payload, passes each event to onEvent and answers 200, or answers
+		// 400 to a payload that does not check out.
+		//
+		// ```
+		// try mux.handle("POST /apple/events", apple.notifications(def (n apple.Notification) !none {
+		// 	return try accounts.remove(n.subject) when n.kind == apple.NotificationKind.AccountDeleted
+		// }))
+		// ```
+		def notifications(onEvent def (Notification) !none) def (Context) !none {
+			return def (ctx Context) !none {
+				let event = notification(try ctx.text()) onerror (err error) {
+					return try ctx.text(400, err.message)
+				}
+				try onEvent(event)
+				return try ctx.text("")
+			}
+		}
+
+		// notification reads and verifies one notification body (JSON with
+		// the signed `payload`). Fails with InvalidToken when the payload is
+		// not signed by Apple for this app, and Malformed when it is not a
+		// notification.
+		def notification(body string) !Notification {
+			let parsed = new JSON().parse(body) onerror fail malformed("the notification is not JSON")
+			let outer = new map<string, any>()
+			outer = parsed when parsed is map<string, any>
+			let payload = outer.get("payload")
+			fail malformed("the notification has no payload") unless payload is string
+			let rp = try relyingParty()
+			let keys = rp.keys
+			fail malformed("Apple's keys are unknown") when keys is none
+			let claims ?jose.Claims = none
+			for let audience in withServicesId(bundleIds) {
+				let v = jose.Validation{algorithms: [jose.SignatureAlgorithm.RS256, jose.SignatureAlgorithm.ES256], issuer: issuer, audience: audience}
+				let verified = jose.verifyJwt(payload, keys, v) onerror (err error) {
+					continue
+				}
+				claims = verified
+				break
+			}
+			fail invalid("the notification is not signed by Apple for this app") when claims is none
+			let events = claims.get("events")
+			fail malformed("the notification has no events") unless events is string
+			let decoded = new JSON().parse(events) onerror fail malformed("the notification's events are not JSON")
+			let event = new map<string, any>()
+			event = decoded when decoded is map<string, any>
+			let kind = notificationKind(textAt(event, "type"))
+			fail malformed("unknown notification type {textAt(event, "type")}") when kind is none
+			let n = Notification{kind: kind, subject: textAt(event, "sub"), time: time.fromUnixNs(int64(millisAt(event, "event_time")) * 1000000)}
+			let email = textAt(event, "email")
+			n.email = email unless email == ""
+			n.isPrivateEmail = flagAt(event, "is_private_email")
+			return n
+		}
+
+		// realUser is the real-person indicator of a native sign-in's claims.
+		def realUser(claims IdClaims) RealUser {
+			let v = claims.get("real_user_status")
+			let level = v is int ?? (v, 0)
+			return RealUser(level) when level >= 0 && level < RealUser.values().len()
+			return RealUser.Unsupported
+		}
+
+		// relyingParty discovers Apple once and makes a client secret,
+		// renewed before it expires: a new relying party with the new
+		// secret replaces the old one, which tasks still using it keep.
+		internal def relyingParty() !openid.RelyingParty {
+			let (known, due) = current()
+			return known when !(known is none) && !due
+			let provider = known is none ?? (try openid.discover(issuer, httpClient), known.provider)
+			let rp = new openid.RelyingParty(servicesId, provider)
+			rp.client.httpClient = httpClient
+			rp.client.authentication = oauth2.ClientAuthentication.SecretPost
+			let now = time.now()
+			rp.client.secret = try clientSecret(now)
+			if known is none {
+				let jwks = provider.oauth.jwksUri
+				rp.keys = new jose.RemoteKeySet(jwks, httpClient) unless jwks is none
+			} else {
+				rp.keys = known.keys
+			}
+			rp.authorizedParties = bundleIds
+			return keep(rp, now + secretLifetime - secretRenewal)
+		}
+
+		// clientSecret is the ES256 JWT Apple takes as the client secret.
+		internal def clientSecret(now time.Time) !Secret<string> {
+			let block = pemDecode(key.reveal()) onerror fail malformed("the private key is not PEM")
+			let signer = new jose.Jwk(parsePKCS8PrivateKey(block.bytes) onerror fail malformed("the private key is not a PKCS#8 key"))
+			signer.kid = keyId
+			let claims = new jose.Claims()
+			claims.issuer = teamId
+			claims.subject = servicesId
+			claims.audience = [issuer]
+			claims.issuedAt = now
+			claims.expires = now + secretLifetime
+			return try claims.sign(signer, jose.SignatureAlgorithm.ES256)
+		}
+
+		internal atomic def current() (?openid.RelyingParty, bool) {
+			return (party, !time.now().before(renewAt))
+		}
+
+		internal atomic def keep(rp openid.RelyingParty, renew time.Time) openid.RelyingParty {
+			let earlier = party
+			return earlier when !(earlier is none) && time.now().before(renewAt)
+			party = rp
+			renewAt = renew
+			return rp
+		}
+
+		internal def withServicesId(ids string[]) string[] {
+			let out = [servicesId]
+			for let id in ids {
+				out.push(id)
+			}
+			return out
+		}
+	}
+
+	// fillProfile reads Apple's claims into the profile: `email_verified`
+	// and `is_private_email` come as strings or booleans.
+	internal def fillProfile(login Login) {
+		let p = login.profile
+		p.emailVerified = flagOf(login.claims.get("email_verified"))
+	}
+
+	// nameOf reads the name from the `user` field Apple adds to the form
+	// of a first sign-in; none when absent.
+	internal def nameOf(callback string) ?string {
+		let text = callback
+		let at = text.indexOf("?")
+		text = text[at + 1:] when at >= 0
+		let form = parseQuery(text) onerror (err error) {
+			return none
+		}
+		let user = form.get("user")
+		return none when user is none
+		let parsed = new JSON().parse(user) onerror recover none
+		return none unless parsed is map<string, any>
+		let name = parsed.get("name")
+		return none unless name is map<string, any>
+		let parts string[] = []
+		for let field in ["firstName", "middleName", "lastName"] {
+			let part = textAt(name, field)
+			parts.push(part) unless part == ""
+		}
+		return parts.len() == 0 ?? (none, parts.join(" "))
+	}
+
+	internal def notificationKind(value string) ?NotificationKind {
+		for let (i, v) in NotificationKind.values() {
+			return NotificationKind(i) when v == value
+		}
+		return none
+	}
+
+	internal def withSignInScopes(scopes string[]) string[] {
+		let all string[] = []
+		for let s in signInScopes {
+			all.push(s)
+		}
+		for let s in scopes {
+			all.push(s) unless s in all
+		}
+		return all
+	}
+
+	internal def textAt(m map<string, any>, name string) string {
+		let v = m.get(name)
+		return v is string ?? (v, "")
+	}
+
+	internal def millisAt(m map<string, any>, name string) int {
+		let v = m.get(name)
+		return v is int ?? (v, 0)
+	}
+
+	internal def flagAt(m map<string, any>, name string) bool {
+		return flagOf(m.get(name))
+	}
+
+	// flagOf reads a boolean Apple sends as true or as "true".
+	internal def flagOf(v ?any) bool {
+		return (v is bool && v) || (v is string && v == "true")
+	}
+
+	internal def refused(text string) error {
+		return oauth2.OAuthError{message: "apple: " + text, code: oauth2.OAuthErrorKind.AccessDenied.value, kind: oauth2.OAuthErrorKind.AccessDenied, description: text}
+	}
+
+	internal def invalid(text string) error {
+		return oauth2.OAuthError{message: "apple: " + text, code: oauth2.OAuthErrorKind.InvalidToken.value, kind: oauth2.OAuthErrorKind.InvalidToken, description: text}
+	}
+
+	internal def malformed(text string) error {
+		return oauth2.OAuthError{message: "apple: " + text, code: oauth2.OAuthErrorKind.Malformed.value, kind: oauth2.OAuthErrorKind.Malformed, description: text}
+	}
 }

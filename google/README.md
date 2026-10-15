@@ -11,10 +11,10 @@ adm get admlang:adm.auth.google
 use adm.auth.google
 
 let provider = new google.Provider(clientId, clientSecret, redirectURL = "https://example.com/auth/google")
-let start = try provider.begin(scopes = ["email", "profile"])
-// send the browser to start.url, keep start.state in the session
+let request = try provider.start()              // email and profile; more scopes as an argument
+// send the browser to request.url, keep request with the session
 
-let login = try provider.complete(callbackURL, start)
+let login = try provider.exchange(request, callbackURL)
 let profile = login.profile
 print("{profile.name} <{profile.email}>")
 

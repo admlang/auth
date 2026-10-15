@@ -13,8 +13,8 @@ use adm.auth.microsoft
 
 let provider = new microsoft.Provider(clientId, clientSecret, tenant = "organizations",
 	redirectURL = "https://example.com/auth/microsoft")
-let start = try provider.begin(scopes = ["openid", "profile", "email", "User.Read"])
-let login = try provider.complete(callbackURL, start)
+let request = try provider.start(["Calendars.Read"])   // besides the profile and Graph's /me
+let login = try provider.exchange(request, callbackURL)
 print(login.profile.email)
 print(login.claims.get("tid"))                    // the user's tenant
 ```
